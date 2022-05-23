@@ -1,155 +1,150 @@
 package mr
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
-	"path/filepath"
-	"strconv"
-	"sync"
 	"time"
 )
 
-
 type Coordinator struct {
 	// Your definitions here.
-	done chan struct{}
-	jobQueue chan *job
-	//TODO
-	// reduceJobQueue chan *job
-	runningJobs sync.Map
-	nReduce int
-	nMap int
+	doneCh   chan struct{}
+	jobQueue *JobQueue
+	nReduce  int
+	nMap     int
 
-}
-
-type job struct {
-	Jobtype string
-	Filename string
-	Index int
+	files []string
 }
 
 // Your code here -- RPC handlers for the worker to call.
 
-
-func (c *Coordinator) addRunningJob(j *job) {
-	c.runningJobs.Store(*j, make(chan struct{}))
-
-	// spawn a goroutine that monitors the running task
-	go c.watchJob(j)
-}
-
-func (c *Coordinator) watchJob(j *job) {
-	val, ok := c.runningJobs.Load(*j)
-	jobDoneCh := val.(chan struct{})
-	if !ok {
-		// job was not properly registered
-		return
-	}
-
-	select {
-	case <-time.After(10*time.Second):
-		// resubmit a new job
-		println("resubmitting due to timeout")
-		c.jobQueue <- j
-
-		// no need to a running job as done
-		// c.runningJobs.Delete(j)
-	case <-jobDoneCh:
-		c.runningJobs.Delete(j)
-	}
-}
-
-
 //
-// an example RPC handler.
+// RPC handler.
 //
 // the RPC argument and reply types are defined in rpc.go.
 //
 func (c *Coordinator) GetTask(request *struct{}, task *TaskRequest) error {
-	// this operation should be function
-
-	j := c.scheduleJob()
+	j := c.jobQueue.GetJob()
 
 	task.Filename = j.Filename
 	task.Tasktype = j.Jobtype
-	task.Number = j.Index
+	task.Number = j.Number
 	task.NReduce = c.nReduce
+	task.NMap = c.nMap
 	return nil
-}
-
-func (c *Coordinator) scheduleJob() *job {
-
-	j := <- c.jobQueue
-
-	c.addRunningJob(j)
-
-	return j
-}
-
-
-//TODO
-func (c *Coordinator) onTaskFinish(task *TaskRequest) error {
-
-	if task.Tasktype == "map" {
-		c.dispatchReduceTask()
-	} else if task.Tasktype == "reduce" {
-		c.notifyIfDone()
-	}
-
-	job := &job{task.Tasktype, task.Filename, task.Number}
-	// remove from running jobs
-	val, ok := c.runningJobs.LoadAndDelete(*job)
-
-	if !ok { // already finished
-		println("not existing in runningJobs")
-		return nil
-	}
-
-	println("finished:", job.Jobtype, job.Filename)
-	jobDoneCh := val.(chan struct{})
-	close(jobDoneCh)
-
-	return nil
-}
-
-func (c *Coordinator) dispatchReduceTask() {
-	// hack: check if n finished files exist for r
-	for i := 0; i < c.nReduce; i++ {
-		files, err := filepath.Glob("mr-*-" + strconv.Itoa(i))
-		if err != nil {
-			return
-		}
-
-		if (len(files) == c.nMap) {
-			// can dispatch
-			j := &job{"reduce", "mr-*-" + strconv.Itoa(i), i}
-			c.jobQueue <- j
-		}
-	}
-}
-
-func (c * Coordinator) notifyIfDone() {
-
-	files, _ := filepath.Glob("mr-out-*")
-
-	if (len(files) == c.nReduce) {
-		close(c.done)
-	}
 }
 
 //
-// an example RPC handler.
+// RPC handler.
 //
 // the RPC argument and reply types are defined in rpc.go.
 //
 func (c *Coordinator) TaskDone(task *TaskRequest, empty *struct{}) error {
-	// if the finished task was a map type, submit a reduce task to the queue
 	go c.onTaskFinish(task)
 
-	// go c.notifyIfDone()
+	return nil
+}
+
+func (c *Coordinator) initialize() {
+	c.jobQueue.SubmitJobs(c.allMapTasks())
+	go c.submitReduce()
+}
+
+func (c *Coordinator) allMapTasks() []*Job {
+	res := make([]*Job, 0, len(c.files))
+
+	for idx, name := range c.files {
+
+		job := Job{
+			Jobtype:  "map",
+			Filename: name,
+			Number:   idx,
+		}
+		res = append(res, &job)
+	}
+
+	return res
+}
+
+func (c *Coordinator) allReduceTasks() []*Job {
+	res := make([]*Job, 0, c.nReduce)
+
+	for i := 0; i < c.nReduce; i++ {
+		job := Job{
+			Jobtype: "reduce",
+			//TODO: come up with a better glob
+			//don't use a star: it clashes with mr-worker... in job test
+			Filename: fmt.Sprintf("mr-[0-9]-%d", i),
+			Number:   i,
+		}
+		res = append(res, &job)
+	}
+
+	return res
+}
+
+func (c *Coordinator) submitReduce() {
+
+	c.jobQueue.WaitJobs(c.allMapTasks())
+	c.jobQueue.SubmitJobs(c.allReduceTasks())
+
+	go c.waitForDone()
+}
+
+//
+// RPC handler.
+//
+// the RPC argument and reply types are defined in rpc.go.
+//
+func (c *Coordinator) ReportMapFailure(report *FailureReport, empty *struct{}) error {
+	// insert the map task in to the queue again
+	// reduce tasks that reported fail will not proceed; and will be automatically retried
+	failingMapJobs := report.FailingMapNumbers
+
+	jobs := make([]*Job, 0, len(failingMapJobs))
+	for _, v := range failingMapJobs {
+		job := Job{
+			Jobtype:  "map",
+			Filename: c.files[v],
+			Number:   v,
+		}
+		jobs = append(jobs, &job)
+	}
+	c.jobQueue.SubmitJobs(jobs)
+	c.jobQueue.WaitJobs(jobs)
+
+	failingReducerJob := report.FailingReduceNumber
+
+	reduceJob := Job{
+		Jobtype:  "reduce",
+		Filename: fmt.Sprintf("mr-[0-9]-%d", failingReducerJob),
+		Number:   failingReducerJob,
+	}
+	c.jobQueue.RemoveJob(&reduceJob)
+	c.jobQueue.SubmitJob(&reduceJob)
+
+	return nil
+}
+
+func (c *Coordinator) waitForDone() {
+	c.jobQueue.WaitJobs(c.allReduceTasks())
+
+	close(c.doneCh)
+}
+
+func (c *Coordinator) onTaskFinish(task *TaskRequest) error {
+
+	job := &Job{
+		Jobtype:  task.Tasktype,
+		Filename: task.Filename,
+		Number:   task.Number,
+	}
+	// remove from running jobs
+	c.jobQueue.RemoveJob(job)
 
 	return nil
 }
@@ -171,11 +166,10 @@ func (c *Coordinator) server() {
 }
 
 //
-// main/mrcoordinator.go calls Done() periodically to find out
-// if the entire job has finished.
+// main/mrcoordinator.go calls Done() once
 //
 func (c *Coordinator) Done() <-chan struct{} {
-	return c.done
+	return c.doneCh
 }
 
 //
@@ -184,20 +178,20 @@ func (c *Coordinator) Done() <-chan struct{} {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	// initialize map tasks
+
+	// correct way to determine the size of jobQueue
+	jobQueue := NewJobQueue(1000, 10*time.Second)
 
 	c := Coordinator{
-		make(chan struct{}),
-		// correct way to determine the size buffered channel?
-		make(chan *job, 1000),
-		sync.Map{},
-		nReduce,
-		len(files)}
-
-	for idx, name := range files {
-
-		newJob := job{"map", name, idx}
-		c.jobQueue <- &newJob
+		doneCh:   make(chan struct{}),
+		jobQueue: jobQueue,
+		nReduce:  nReduce,
+		nMap:     len(files),
+		files:    files,
 	}
+
+	c.initialize()
 
 	// Your code here.
 

@@ -39,12 +39,11 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
 func Worker(mapf func(string, string) []KeyValue,
-		reducef func(string, []string) string) {
+	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
 
@@ -54,6 +53,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		if err != nil {
 			return
 		}
+		// println("Starting", task.Tasktype, task.Filename, task.Number)
 
 		//do some job
 		if task.Tasktype == "map" {
@@ -62,9 +62,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			reduceTask(reducef, task)
 		}
 
-
-		println(task.Tasktype, task.Filename, task.Number)
-		reportDone(task)
+		// println("finished", task.Tasktype, task.Filename, task.Number)
 	}
 }
 
@@ -73,7 +71,7 @@ func mapTask(mapf func(string, string) []KeyValue, task *TaskRequest) {
 	filename := task.Filename
 	nReduce := task.NReduce
 	n := task.Number
-	
+
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot open %v", filename)
@@ -87,59 +85,87 @@ func mapTask(mapf func(string, string) []KeyValue, task *TaskRequest) {
 	kvs := mapf(filename, string(content))
 
 	// group kvs by reduceTaskNumber
-	groupedKv := make(map[int][]KeyValue)
 
+	tempFiles := make(map[int]*os.File, nReduce)
+	// create nReduce temp files
+	for i := 0; i < nReduce; i++ {
+		tempFile, _ := ioutil.TempFile(".", "")
+		tempFiles[i] = tempFile
+	}
+
+	groupedKv := make(map[int][]KeyValue, nReduce)
 	for _, kv := range kvs {
 		reduceTaskNumber := ihash(kv.Key) % nReduce
 		groupedKv[reduceTaskNumber] = append(groupedKv[reduceTaskNumber], kv)
+
 	}
 
-	//create nReduce tempfiles to write
-	tempFiles := []*os.File{}
-	for i := 0; i < nReduce; i++ {
-		tempFile, err := ioutil.TempFile("./mr-tmp", "")
-		if err != nil {
-			log.Fatalf("cannot create file %v", tempFile)
-		}
-		tempFiles = append(tempFiles, tempFile)
-		defer tempFile.Close()
-	}
-		
+	for idx, kvs := range groupedKv {
+		tempFile := tempFiles[idx]
 
-	for rTaskNumber, kvs := range groupedKv {
-		enc := json.NewEncoder(tempFiles[rTaskNumber])
+		enc := json.NewEncoder(tempFile)
 		for _, kv := range kvs {
 			err := enc.Encode(&kv)
 			if err != nil {
 				log.Fatalf("cannot write to file")
 			}
 		}
-		resultName := fmt.Sprintf("mr-%d-%d", n, rTaskNumber)
-		//TODO: partially report done
-		os.Rename(tempFiles[rTaskNumber].Name(), resultName)
 	}
 
+	for idx, tempFile := range tempFiles {
+		resultName := fmt.Sprintf("mr-%d-%d", n, idx)
+		os.Rename(tempFile.Name(), resultName)
+		tempFile.Close()
+	}
+
+	reportDone(task)
 }
 
 func reduceTask(reducef func(string, []string) string, task *TaskRequest) {
-	println("got reduce task")
-	println(task.Filename)
-	println(task.Number)
+	filenames, err := filepath.Glob(task.Filename)
 
-	files, err := filepath.Glob(task.Filename)
-
-	kvs := make([]KeyValue, 0)
-
-	if err != nil {
-		return
-	}
-	for _, filename := range files {
-
+	files := make([]*os.File, 0)
+	for _, filename := range filenames {
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("cannot open file")
 		}
+		files = append(files, file)
 		defer file.Close()
+	}
+
+	currentFileNames := map[string]struct{}{}
+	for _, file := range files {
+		currentFileNames[file.Name()] = struct{}{}
+	}
+
+	if len(files) != task.NMap {
+		//something is wrong with map, or it is still running
+		//either way, we report it
+		report := FailureReport{
+			FailingMapNumbers:   []int{},
+			FailingReduceNumber: task.Number,
+		}
+
+		// collect missing files' map task number
+		for i := 0; i < task.NMap; i++ {
+			filename := fmt.Sprintf("mr-%d-%d", i, task.Number)
+			if _, ok := currentFileNames[filename]; !ok {
+				report.FailingMapNumbers = append(report.FailingMapNumbers, i)
+			}
+		}
+		reportMapFailure(&report)
+		// just stop progressing; coordinator should handle reschedule
+		return
+	}
+
+	// from here, since we mounted everything on memory, it's okay
+
+	kvs := make([]KeyValue, 0)
+	if err != nil {
+		return
+	}
+	for _, file := range files {
 		dec := json.NewDecoder(file)
 		for {
 			var kv KeyValue
@@ -173,6 +199,7 @@ func reduceTask(reducef func(string, []string) string, task *TaskRequest) {
 		i = j
 	}
 
+	reportDone(task)
 }
 
 //
@@ -201,7 +228,7 @@ func requestTask() (*TaskRequest, error) {
 	}
 }
 
-func reportDone(task *TaskRequest) (error) {
+func reportDone(task *TaskRequest) error {
 
 	// declare a empty reply structure.
 	reply := struct{}{}
@@ -215,6 +242,23 @@ func reportDone(task *TaskRequest) (error) {
 		return nil
 	} else {
 		return errors.New("failed to report task")
+	}
+}
+
+func reportMapFailure(report *FailureReport) error {
+
+	// declare a empty reply structure.
+	reply := struct{}{}
+
+	// send the RPC request, wait for the reply.
+	// the "Coordinator.Example" tells the
+	// receiving server that we'd like to call
+	// the Example() method of struct Coordinator.
+	ok := call("Coordinator.ReportMapFailure", &report, &reply)
+	if ok {
+		return nil
+	} else {
+		return errors.New("failed to report mapFailure")
 	}
 }
 
@@ -233,10 +277,5 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	defer c.Close()
 
 	err = c.Call(rpcname, args, reply)
-	if err == nil {
-		return true
-	}
-
-	fmt.Println(err)
-	return false
+	return err == nil
 }

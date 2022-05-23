@@ -25,7 +25,7 @@ func main() {
 
 	m := mr.MakeCoordinator(os.Args[1:], 10)
 	select {
-	case <- m.Done():
+	case <-m.Done():
 		time.Sleep(time.Second)
 	}
 }

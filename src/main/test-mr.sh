@@ -55,6 +55,7 @@ rm -f mr-*
 (cd ../../mrapps && go build $RACE -buildmode=plugin early_exit.go) || exit 1
 (cd ../../mrapps && go build $RACE -buildmode=plugin crash.go) || exit 1
 (cd ../../mrapps && go build $RACE -buildmode=plugin nocrash.go) || exit 1
+(cd ../../mrapps && go build $RACE -buildmode=plugin wcfail.go) || exit 1
 (cd .. && go build $RACE mrcoordinator.go) || exit 1
 (cd .. && go build $RACE mrworker.go) || exit 1
 (cd .. && go build $RACE mrsequential.go) || exit 1
@@ -97,8 +98,52 @@ else
   failed_any=1
 fi
 
-# wait for remaining workers and coordinator to exit.
+# # wait for remaining workers and coordinator to exit.
 wait
+
+#########################################################
+# word-count with filesystem failure
+rm -f mr-*
+
+# generate the correct output
+../mrsequential ../../mrapps/wc.so ../pg*txt || exit 1
+sort mr-out-0 > mr-correct-wc.txt
+rm -f mr-out*
+
+echo '***' Starting wc test with filesystem failure
+
+$TIMEOUT ../mrcoordinator ../pg*txt &
+pid=$!
+
+# give the coordinator time to create the sockets.
+sleep 1
+
+# start multiple workers.
+$TIMEOUT ../mrworker ../../mrapps/wcfail.so &
+$TIMEOUT ../mrworker ../../mrapps/wcfail.so &
+$TIMEOUT ../mrworker ../../mrapps/wcfail.so &
+
+# wait for the coordinator to exit.
+wait $pid
+
+# since workers are required to exit when a job is completely finished,
+# and not before, that means the job has finished.
+sort mr-out* | grep . > mr-wc-all
+if cmp mr-wc-all mr-correct-wc.txt
+then
+  echo '---' wc test: PASS
+else
+  echo '---' wc output is not the same as mr-correct-wc.txt
+  echo '---' wc test: FAIL
+  failed_any=1
+fi
+
+rm -f deletedOnce
+
+# # wait for remaining workers and coordinator to exit.
+wait
+
+#########################################################
 
 #########################################################
 # now indexer
@@ -317,6 +362,7 @@ else
 fi
 
 #########################################################
+
 if [ $failed_any -eq 0 ]; then
     echo '***' PASSED ALL TESTS
 else
