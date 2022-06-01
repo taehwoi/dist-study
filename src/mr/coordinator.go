@@ -1,12 +1,14 @@
 package mr
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -15,7 +17,6 @@ type Coordinator struct {
 	doneCh   chan struct{}
 	jobQueue *JobQueue
 	nReduce  int
-	nMap     int
 
 	files []string
 }
@@ -28,14 +29,59 @@ type Coordinator struct {
 // the RPC argument and reply types are defined in rpc.go.
 //
 func (c *Coordinator) GetTask(request *struct{}, task *TaskRequest) error {
-	j := c.jobQueue.GetJob()
+	var j *Job
 
-	task.Filename = j.Filename
+	for {
+		j = c.jobQueue.GetJob()
+
+		// don't send psuedo tasks to workers
+		switch j.Jobtype {
+		case "pseudo":
+			continue
+		case "done":
+			close(c.doneCh)
+		default:
+		}
+		break
+	}
+
+	go c.watchJob(context.TODO(), j)
+
+	if j.Jobtype == "reduce" {
+
+		//TODO
+		task.Filenames = []string{
+			fmt.Sprintf("mr-0-%s", j.Key),
+			fmt.Sprintf("mr-1-%s", j.Key),
+			fmt.Sprintf("mr-2-%s", j.Key),
+			fmt.Sprintf("mr-3-%s", j.Key),
+			fmt.Sprintf("mr-4-%s", j.Key),
+			fmt.Sprintf("mr-5-%s", j.Key),
+			fmt.Sprintf("mr-6-%s", j.Key),
+			fmt.Sprintf("mr-7-%s", j.Key),
+		}
+
+	} else if j.Jobtype == "map" {
+		idx, _ := strconv.Atoi(j.Key)
+		task.Filenames = []string{c.files[idx]}
+	}
+
 	task.Tasktype = j.Jobtype
-	task.Number = j.Number
+	task.Key = j.Key
 	task.NReduce = c.nReduce
-	task.NMap = c.nMap
+	task.NMap = len(c.files)
 	return nil
+}
+
+func (c *Coordinator) watchJob(ctx context.Context, j *Job) {
+
+	select {
+	case <-time.After(10 * time.Second):
+		println("retry due to timeout", j.Jobtype, j.Key)
+		j.Retry()
+	case <-j.Done:
+	}
+
 }
 
 //
@@ -43,56 +89,55 @@ func (c *Coordinator) GetTask(request *struct{}, task *TaskRequest) error {
 //
 // the RPC argument and reply types are defined in rpc.go.
 //
-func (c *Coordinator) TaskDone(task *TaskRequest, empty *struct{}) error {
-	go c.onTaskFinish(task)
+func (c *Coordinator) TaskDone(report *SuccessReport, empty *struct{}) error {
+	go c.onTaskFinish(report)
 
 	return nil
 }
 
 func (c *Coordinator) initialize() {
-	c.jobQueue.SubmitJobs(c.allMapTasks())
-	go c.submitReduce()
-}
 
-func (c *Coordinator) allMapTasks() []*Job {
-	res := make([]*Job, 0, len(c.files))
+	mapJobs := make([]*Job, 0, len(c.files))
 
-	for idx, name := range c.files {
+	for idx := range c.files {
 
-		job := Job{
-			Jobtype:  "map",
-			Filename: name,
-			Number:   idx,
-		}
-		res = append(res, &job)
+		job := NewJob("map", strconv.Itoa(idx), []*Job{})
+		mapJobs = append(mapJobs, job)
 	}
 
-	return res
-}
+	c.jobQueue.SubmitJobs(mapJobs)
 
-func (c *Coordinator) allReduceTasks() []*Job {
-	res := make([]*Job, 0, c.nReduce)
+	reduceJobs := make([]*Job, 0, c.nReduce)
 
 	for i := 0; i < c.nReduce; i++ {
-		job := Job{
-			Jobtype: "reduce",
-			//TODO: come up with a better glob
-			//don't use a star: it clashes with mr-worker... in job test
-			Filename: fmt.Sprintf("mr-[0-9]-%d", i),
-			Number:   i,
-		}
-		res = append(res, &job)
+		deps := c.intermediateTasks(i)
+		c.jobQueue.SubmitJobs(deps)
+
+		reduceJob := NewJob("reduce", strconv.Itoa(i), deps)
+
+		reduceJobs = append(reduceJobs, reduceJob)
+	}
+	c.jobQueue.SubmitJobs(reduceJobs)
+
+	doneTask := Job{
+		Jobtype: "done",
+		Key:     "done",
+		Deps:    reduceJobs,
+	}
+	c.jobQueue.SubmitJob(&doneTask)
+}
+
+// returns all the intermediate tasks reducer depends on
+func (c *Coordinator) intermediateTasks(reducerId int) []*Job {
+	res := make([]*Job, 0, len(c.files))
+
+	for idx := range c.files {
+
+		job := NewJob("pseudo", fmt.Sprintf("%d%d", idx, reducerId), []*Job{})
+		res = append(res, job)
 	}
 
 	return res
-}
-
-func (c *Coordinator) submitReduce() {
-
-	c.jobQueue.WaitJobs(c.allMapTasks())
-	c.jobQueue.SubmitJobs(c.allReduceTasks())
-
-	go c.waitForDone()
 }
 
 //
@@ -108,43 +153,35 @@ func (c *Coordinator) ReportMapFailure(report *FailureReport, empty *struct{}) e
 	jobs := make([]*Job, 0, len(failingMapJobs))
 	for _, v := range failingMapJobs {
 		job := Job{
-			Jobtype:  "map",
-			Filename: c.files[v],
-			Number:   v,
+			Jobtype: "map",
+			Key:     strconv.Itoa(v),
 		}
 		jobs = append(jobs, &job)
 	}
 	c.jobQueue.SubmitJobs(jobs)
-	c.jobQueue.WaitJobs(jobs)
+	// c.jobQueue.WaitJobs(jobs)
 
 	failingReducerJob := report.FailingReduceNumber
 
 	reduceJob := Job{
-		Jobtype:  "reduce",
-		Filename: fmt.Sprintf("mr-[0-9]-%d", failingReducerJob),
-		Number:   failingReducerJob,
+		Jobtype: "reduce",
+		Key:     strconv.Itoa(failingReducerJob),
 	}
-	c.jobQueue.RemoveJob(&reduceJob)
+	// c.jobQueue.RemoveJob(&reduceJob)
 	c.jobQueue.SubmitJob(&reduceJob)
 
 	return nil
 }
 
-func (c *Coordinator) waitForDone() {
-	c.jobQueue.WaitJobs(c.allReduceTasks())
-
-	close(c.doneCh)
-}
-
-func (c *Coordinator) onTaskFinish(task *TaskRequest) error {
+func (c *Coordinator) onTaskFinish(report *SuccessReport) error {
 
 	job := &Job{
-		Jobtype:  task.Tasktype,
-		Filename: task.Filename,
-		Number:   task.Number,
+		Jobtype: report.Tasktype,
+		Key:     report.Key,
+		Output:  report.OutputFilename,
 	}
 	// remove from running jobs
-	c.jobQueue.RemoveJob(job)
+	c.jobQueue.Finish(job)
 
 	return nil
 }
@@ -181,13 +218,12 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// initialize map tasks
 
 	// correct way to determine the size of jobQueue
-	jobQueue := NewJobQueue(1000, 10*time.Second)
+	jobQueue := NewJobQueue(1000)
 
 	c := Coordinator{
 		doneCh:   make(chan struct{}),
 		jobQueue: jobQueue,
 		nReduce:  nReduce,
-		nMap:     len(files),
 		files:    files,
 	}
 

@@ -2,36 +2,85 @@ package mr
 
 import (
 	"sync"
-	"time"
 )
 
-type JobQueue struct {
-	// Your definitions here.
-	jobCh       chan *Job
-	runningJobs sync.Map // map[job][chan struct{}]
-	timeout     time.Duration
-}
-
 type Job struct {
-	Jobtype  string
-	Filename string
-	Number   int
+	Jobtype string
+	Key     string
+	Done    chan string // channel for monitoring job status. closed when done
+	Deps    []*Job      // dependent jobs; job will only be scheduled when deps are done
+
+	Inputs []string
+
+	Output string
+
+	queue *JobQueue // the pointer to the queue this job is running on
+
 }
 
-func NewJobQueue(size int, timeout time.Duration) *JobQueue {
+func NewJob(jobType string, key string, deps []*Job) *Job {
+	return &Job{
+		Jobtype: jobType,
+		Key:     key,
+		Deps:    deps,
+		Done:    make(chan string),
+	}
+
+}
+
+func (j *Job) id() string {
+
+	return j.Jobtype + j.Key
+}
+
+// Retry the task, adding it to the back of the queue.
+func (j *Job) Retry() {
+
+	// never been submitted
+	if j.queue == nil {
+		return
+	}
+
+	//resubmit
+	j.queue.SubmitJob(j)
+}
+
+type JobQueue struct {
+	jobCh       chan *Job
+	runningJobs sync.Map // map[job.id()][*job]
+}
+
+func NewJobQueue(size int) *JobQueue {
 	jobCh := make(chan *Job, size)
 
 	return &JobQueue{
 		jobCh:       jobCh,
 		runningJobs: sync.Map{},
-		timeout:     timeout,
 	}
 }
 
-// blocks if job queue is full
 func (jq *JobQueue) SubmitJob(j *Job) {
-	jq.jobCh <- j
-	jq.runningJobs.Store(*j, make(chan struct{}))
+
+	go jq.scheduleJob(j)
+}
+
+// blocks if job queue is full
+func (jq *JobQueue) scheduleJob(job *Job) {
+
+	// wait until deps have been finished before scheduling the job
+	wg := sync.WaitGroup{}
+	for _, depJob := range job.Deps {
+		wg.Add(1)
+		go func(job *Job) {
+			defer wg.Done()
+			<-job.Done
+		}(depJob)
+	}
+	wg.Wait()
+
+	job.queue = jq
+	jq.jobCh <- job
+	jq.runningJobs.Store(job.id(), job)
 }
 
 // blocks if job queue is full
@@ -45,71 +94,21 @@ func (jq *JobQueue) SubmitJobs(jobs []*Job) {
 func (jq *JobQueue) GetJob() *Job {
 	j := <-jq.jobCh
 
-	go jq.watchJob(j)
-
 	return j
 }
 
-// blocks until job is finished via RemoveJob, if it is running
-func (jq *JobQueue) WaitJob(j *Job) {
-	val, ok := jq.runningJobs.Load(*j)
-	if !ok {
-		// job was not properly registered
-		return
-	}
-	jobDoneCh := val.(chan struct{})
-	<-jobDoneCh
-}
-
-// blocks until all jobs is finished via RemoveJob, if it is running
-func (jq *JobQueue) WaitJobs(jobs []*Job) {
-	wg := sync.WaitGroup{}
-
-	for _, job := range jobs {
-		if val, ok := jq.runningJobs.Load(*job); ok {
-			jobDoneCh := val.(chan struct{})
-
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				<-jobDoneCh
-			}()
-		}
-	}
-
-	wg.Wait()
-}
-
-func (jq *JobQueue) RemoveJob(j *Job) error {
+func (jq *JobQueue) Finish(j *Job) error {
 
 	// remove from running jobs
-	val, loaded := jq.runningJobs.LoadAndDelete(*j)
+	val, loaded := jq.runningJobs.LoadAndDelete(j.id())
 
 	if !loaded { // already finished, or was never in the queue
 		return nil
 	}
 
-	jobDoneCh := val.(chan struct{})
-	close(jobDoneCh)
+	job := val.(*Job)
+	job.Done <- job.Output
+	close(job.Done)
 
 	return nil
-}
-
-func (jq *JobQueue) watchJob(j *Job) {
-	val, ok := jq.runningJobs.Load(*j)
-	if !ok {
-		// job was not properly registered
-		return
-	}
-	jobDoneCh := val.(chan struct{})
-
-	select {
-	case <-time.After(jq.timeout):
-		// resubmit a new job
-		println("resubmitting due to timeout", j.Filename, j.Jobtype, j.Number)
-		jq.jobCh <- j
-		// shouldn't remove from running; processes waiting for the job to finish will be falsely notified
-	case <-jobDoneCh:
-		jq.runningJobs.Delete(*j)
-	}
 }
