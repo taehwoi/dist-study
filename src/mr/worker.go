@@ -100,14 +100,14 @@ func mapTask(mapf func(string, string) []KeyValue, task *TaskRequest) {
 		enc := json.NewEncoder(tempFile)
 		kvs, ok := groupedKv[i]
 		if !ok {
-			// report there is an empty reducer
+			// report there is no output for reducer
 			report := &SuccessReport{
 				OutputFilename: "",
 				Tasktype:       "pseudo",
 				Key:            fmt.Sprintf("%s%d", n, i),
 			}
 			reportDone(report)
-			// continue
+			continue
 		}
 
 		for _, kv := range kvs {
@@ -142,39 +142,32 @@ func reduceTask(reducef func(string, []string) string, task *TaskRequest) {
 	filenames := task.Filenames
 
 	files := make([]*os.File, 0)
-	for _, filename := range filenames {
+
+	corruptMapWorkers := make([]int, 0)
+
+	for idx, filename := range filenames {
+		// map worker didn't produce anything
+		if filename == "" {
+			continue
+		}
 		file, err := os.Open(filename)
 		if err != nil {
-			log.Fatalf("cannot open file")
+			// something is wrong with map
+			log.Println("cannot open file; something is wrong with map worker's filesystem")
+			corruptMapWorkers = append(corruptMapWorkers, idx)
+			continue
 		}
 		files = append(files, file)
 		defer file.Close()
 	}
 
-	currentFileNames := map[string]struct{}{}
-	for _, file := range files {
-		currentFileNames[file.Name()] = struct{}{}
-	}
-
-	if len(files) != task.NMap {
-		//something is wrong with map, or it is still running
-		//either way, we report it
-		x, _ := strconv.Atoi(task.Key)
+	if len(corruptMapWorkers) != 0 {
+		currentReducerNumber, _ := strconv.Atoi(task.Key)
 		report := FailureReport{
-			FailingMapNumbers:   []int{},
-			FailingReduceNumber: x,
-		}
-
-		// collect missing files' map task number
-		for i := 0; i < task.NMap; i++ {
-			filename := fmt.Sprintf("mr-%d-%s", i, task.Key)
-			if _, ok := currentFileNames[filename]; !ok {
-				report.FailingMapNumbers = append(report.FailingMapNumbers, i)
-			}
+			FailingMapNumbers:   corruptMapWorkers,
+			FailingReduceNumber: currentReducerNumber,
 		}
 		reportMapFailure(&report)
-		// just stop progressing; coordinator should handle reschedule
-		return
 	}
 
 	// from here, since we mounted everything on memory, it's okay

@@ -48,19 +48,9 @@ func (c *Coordinator) GetTask(request *struct{}, task *TaskRequest) error {
 	go c.watchJob(context.TODO(), j)
 
 	if j.Jobtype == "reduce" {
-
-		//TODO
-		task.Filenames = []string{
-			fmt.Sprintf("mr-0-%s", j.Key),
-			fmt.Sprintf("mr-1-%s", j.Key),
-			fmt.Sprintf("mr-2-%s", j.Key),
-			fmt.Sprintf("mr-3-%s", j.Key),
-			fmt.Sprintf("mr-4-%s", j.Key),
-			fmt.Sprintf("mr-5-%s", j.Key),
-			fmt.Sprintf("mr-6-%s", j.Key),
-			fmt.Sprintf("mr-7-%s", j.Key),
+		for _, depJob := range j.Deps {
+			task.Filenames = append(task.Filenames, depJob.Output)
 		}
-
 	} else if j.Jobtype == "map" {
 		idx, _ := strconv.Atoi(j.Key)
 		task.Filenames = []string{c.files[idx]}

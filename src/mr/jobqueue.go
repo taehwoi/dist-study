@@ -7,8 +7,8 @@ import (
 type Job struct {
 	Jobtype string
 	Key     string
-	Done    chan string // channel for monitoring job status. closed when done
-	Deps    []*Job      // dependent jobs; job will only be scheduled when deps are done
+	Done    chan struct{} // channel for monitoring job status. closed when done
+	Deps    []*Job        // dependent jobs; job will only be scheduled when deps are done
 
 	Inputs []string
 
@@ -23,7 +23,7 @@ func NewJob(jobType string, key string, deps []*Job) *Job {
 		Jobtype: jobType,
 		Key:     key,
 		Deps:    deps,
-		Done:    make(chan string),
+		Done:    make(chan struct{}),
 	}
 
 }
@@ -107,7 +107,8 @@ func (jq *JobQueue) Finish(j *Job) error {
 	}
 
 	job := val.(*Job)
-	job.Done <- job.Output
+	job.Output = j.Output
+	// job.Done <- j.Output
 	close(job.Done)
 
 	return nil
