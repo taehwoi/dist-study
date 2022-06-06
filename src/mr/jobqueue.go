@@ -46,16 +46,16 @@ func (j *Job) Retry() {
 }
 
 type JobQueue struct {
-	jobCh       chan *Job
-	runningJobs sync.Map // map[job.id()][*job]
+	jobCh chan *Job
+	jobs  sync.Map // map[job.id()][*job]
 }
 
 func NewJobQueue(size int) *JobQueue {
 	jobCh := make(chan *Job, size)
 
 	return &JobQueue{
-		jobCh:       jobCh,
-		runningJobs: sync.Map{},
+		jobCh: jobCh,
+		jobs:  sync.Map{},
 	}
 }
 
@@ -67,7 +67,7 @@ func (jq *JobQueue) SubmitJob(j *Job) {
 // blocks if job queue is full
 func (jq *JobQueue) scheduleJob(job *Job) {
 
-	// wait until deps have been finished before scheduling the job
+	// wait until all the deps have finished before scheduling the job
 	wg := sync.WaitGroup{}
 	for _, depJob := range job.Deps {
 		wg.Add(1)
@@ -80,7 +80,7 @@ func (jq *JobQueue) scheduleJob(job *Job) {
 
 	job.queue = jq
 	jq.jobCh <- job
-	jq.runningJobs.Store(job.id(), job)
+	jq.jobs.Store(job.id(), job)
 }
 
 // blocks if job queue is full
@@ -100,7 +100,7 @@ func (jq *JobQueue) GetJob() *Job {
 func (jq *JobQueue) Finish(j *Job) error {
 
 	// remove from running jobs
-	val, loaded := jq.runningJobs.LoadAndDelete(j.id())
+	val, loaded := jq.jobs.LoadAndDelete(j.id())
 
 	if !loaded { // already finished, or was never in the queue
 		return nil
