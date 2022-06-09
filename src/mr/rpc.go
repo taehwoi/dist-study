@@ -17,16 +17,22 @@ import (
 //
 
 type TaskRequest struct {
-	Filename string
-	Tasktype string
-	Number   int
-	NReduce  int
-	NMap     int
+	Filenames []string
+	Tasktype  string
+	Key       string
+	NReduce   int
+	NMap      int
 }
 
 type FailureReport struct {
 	FailingMapNumbers   []int
 	FailingReduceNumber int
+}
+
+type SuccessReport struct {
+	OutputFilename string
+	Tasktype       string
+	Key            string
 }
 
 // Add your RPC definitions here.
