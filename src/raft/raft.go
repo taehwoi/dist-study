@@ -241,7 +241,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// update term
 		rf.currentTerm = args.Term
 		rf.updateStatus(Follower)
-		// since we updated term, we reset votedFor; we haven't voted for anyone in this term (yet)
+		// since we updated term, we reset votedFor; we haven't voted for anyone in this new term (yet)
 		rf.votedFor = -1
 	}
 
