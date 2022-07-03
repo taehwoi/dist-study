@@ -1,23 +1,22 @@
 package kvraft
 
 import (
+	"sync"
+	"sync/atomic"
+
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
-	"log"
-	"sync"
-	"sync/atomic"
 )
 
 const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
-		log.Printf(format, a...)
+		// log.Printf(format, a...)
 	}
 	return
 }
-
 
 type Op struct {
 	// Your definitions here.
@@ -36,7 +35,6 @@ type KVServer struct {
 
 	// Your definitions here.
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
