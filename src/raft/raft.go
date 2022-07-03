@@ -321,12 +321,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// the appendEntry came from an legitimate leader
 	if args.Term >= rf.currentTerm {
+		rf.currentTerm = args.Term
 		rf.updateStatus(Follower)
+		rf.votedFor = -1
 	}
 
 	// 2. if log doesn't contain an entry at prevLogIndex...
 	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.Success = false
 		reply.Success = false
 		return
 	}
