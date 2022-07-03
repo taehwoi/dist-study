@@ -320,7 +320,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// the appendEntry came from an legitimate leader
-	if args.Term >= rf.currentTerm {
+	// TODO: > ? >=?
+	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.updateStatus(Follower)
 		rf.votedFor = -1
