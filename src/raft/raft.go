@@ -305,7 +305,7 @@ func (rf *Raft) sendRequestVote(ctx context.Context,
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
-	// TODO: should this code check if the appendEntry request is from a valid leader?
+	// TODO: should this code check if the appendEntry request is from a valid leader? <- YES
 	// received heartbeat
 	rf.heartbeatCh <- struct{}{}
 
@@ -502,6 +502,7 @@ func (rf *Raft) sendHeartBeat(ctx context.Context) {
 		}
 		rf.mu.Unlock()
 
+		// TODO: handle replies from appendEntries
 		go rf.sendAppendEntriesToPeers(ctx, req)
 
 		time.Sleep(200 * time.Millisecond)
@@ -509,7 +510,28 @@ func (rf *Raft) sendHeartBeat(ctx context.Context) {
 
 }
 
-func (rf *Raft) sendAppendEntriesToPeers(ctx context.Context, req *AppendEntriesArgs) chan *AppendEntriesReply {
+func (rf *Raft) handleAppendEntryReplies(replyCh chan *AppendEntriesReply) {
+	for reply := range replyCh {
+		rf.mu.Lock()
+
+		if rf.currentTerm != reply.Term {
+			log.Printf("%d received an old reply\n", rf.me)
+			rf.mu.Unlock()
+			return
+		}
+
+		// update term
+		if rf.currentTerm < reply.Term {
+			rf.currentTerm = reply.Term
+			rf.votedFor = -1
+			rf.updateStatus(Follower)
+		}
+		rf.mu.Unlock()
+	}
+
+}
+
+func (rf *Raft) sendAppendEntriesToPeers(ctx context.Context, req *AppendEntriesArgs) {
 	replies := make([]AppendEntriesReply, len(rf.peers))
 	replyCh := make(chan *AppendEntriesReply, len(rf.peers)-1)
 
@@ -528,7 +550,6 @@ func (rf *Raft) sendAppendEntriesToPeers(ctx context.Context, req *AppendEntries
 			})
 		}
 	}
-	// NOTE: we can wait on all Calls because Call() is guaranteed to return.
 
 	go func() {
 		defer close(replyCh)
@@ -536,7 +557,7 @@ func (rf *Raft) sendAppendEntriesToPeers(ctx context.Context, req *AppendEntries
 		log.Println("got all replies from rpc request for append entry")
 	}()
 
-	return replyCh
+	go rf.handleAppendEntryReplies(replyCh)
 }
 
 func (rf *Raft) requestVoteToPeers(ctx context.Context, req *RequestVoteArgs) chan *RequestVoteReply {
