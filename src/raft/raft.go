@@ -22,6 +22,7 @@ import (
 
 	"context"
 	"log"
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -303,6 +304,8 @@ func (rf *Raft) sendRequestVote(ctx context.Context,
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+
+	// TODO: should this code check if the appendEntry request is from a valid leader?
 	// received heartbeat
 	rf.heartbeatCh <- struct{}{}
 
@@ -399,22 +402,25 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 		r := ElectionTimeOutMin + rand.Intn(ElectionTimeOutMax-ElectionTimeOutMin+1)
-		// r can be infinit if leader
+		t := time.Duration(r) * time.Millisecond
+		// r can be infinite if leader
+		if rf.currentStatus() == Leader {
+			// 300 years
+			t = time.Duration(math.MaxInt64)
+		}
 
 		select {
 		case <-rf.heartbeatCh:
 			log.Printf("%d received heartbeat before election timeout\n", rf.me)
 		case <-rf.voteRequestCh:
 			log.Printf("%d received voterequest before election timeout\n", rf.me)
-		case <-time.After(time.Duration(r) * time.Millisecond):
+		case <-time.After(t):
 			// start election
-			if rf.currentStatus() != Leader {
-				// i am a new candidate, or was a candidate
-				rf.updateStatus(Candidate)
-				log.Printf("%d: start election after %d(ms)\n", rf.me, r)
-				// TODO: cancel election if receiving heartbeat
-				go rf.startElection(context.TODO())
-			}
+			// i am a new candidate, or was a candidate
+			rf.updateStatus(Candidate)
+			log.Printf("%d: start election after %d(ms)\n", rf.me, r)
+			// TODO: cancel election if receiving heartbeat
+			go rf.startElection(context.TODO())
 		}
 	}
 }
@@ -437,12 +443,12 @@ func (rf *Raft) startElection(ctx context.Context) {
 	}
 	rf.mu.Unlock()
 
-	// we actually need rf.peers - 1, but this makes indexing easier
 	replyCh := rf.requestVoteToPeers(ctx, &req)
 
 	log.Printf("%d counting votes\n", rf.me)
 
 	votes := 1 // includes my vote
+	// for each incoming vote replies
 	for reply := range replyCh {
 		rf.mu.Lock()
 
@@ -452,18 +458,21 @@ func (rf *Raft) startElection(ctx context.Context) {
 			return
 		}
 
+		// update term
 		rf.currentTerm = Max(reply.Term, rf.currentTerm)
 		rf.mu.Unlock()
 
 		if reply.VoteGranted {
 			votes++
 		}
+		// if we have recieved majority of votes, we don't have to wait for rest of replies
+		// we leave the replyCh open, so that the broadcasting go routine can close it
 		if votes > len(rf.peers)/2 {
+			log.Printf("%d recieved %d / %d votes\n", rf.me, votes, len(rf.peers))
 			break
 		}
 	}
 
-	log.Printf("%d recieved %d / %d votes\n", rf.me, votes, len(rf.peers))
 	log.Printf("%d trying to become a leader...\n", rf.me)
 	succ := rf.tryUpdateStatus(Candidate, Leader)
 	if !succ {
@@ -531,6 +540,7 @@ func (rf *Raft) sendAppendEntriesToPeers(ctx context.Context, req *AppendEntries
 
 func (rf *Raft) requestVoteToPeers(ctx context.Context, req *RequestVoteArgs) chan *RequestVoteReply {
 
+	// we actually need rf.peers - 1, but this makes indexing easier
 	replies := make([]RequestVoteReply, len(rf.peers))
 	replyCh := make(chan *RequestVoteReply, len(rf.peers)-1)
 
