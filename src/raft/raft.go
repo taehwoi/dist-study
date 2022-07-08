@@ -50,21 +50,40 @@ const (
 	ElectionTimeOutMax = ElectionTimeOutMin + 300
 )
 
+type status int32
+
 const (
-	Leader int32 = iota
-	Candidate
-	Follower
+	UNDEFINED status = iota
+	LEADER
+	CANDIDATE
+	FOLLOWER
 )
 
 type event int
 
 const (
-	START event = iota
-	ELECTION_TIMEOUT
-	RECIEVED_MAJOR_VOTES
-	SERVER_WITH_HIGHER_TERM
+	STARTED event = iota
+	ELECTION_TIMEOUTED
+	MAJOR_VOTES_RECEIVED
+	HIGHER_TERM_FOUND
 	CURRENT_LEADER_FOUND
 )
+
+func (e event) String() string {
+	switch e {
+	case STARTED:
+		return "STARTED"
+	case ELECTION_TIMEOUTED:
+		return "ELECTION_TIMEOUTED"
+	case MAJOR_VOTES_RECEIVED:
+		return "MAJOR_VOTES_RECEIVED"
+	case HIGHER_TERM_FOUND:
+		return "HIGHER_TERM_FOUND"
+	case CURRENT_LEADER_FOUND:
+		return "CURRENT_LEADER_FOUND"
+	}
+	return "UNKNOWN"
+}
 
 type Log struct {
 	Term int
@@ -91,7 +110,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
-	status    int32               // Leader, Follower, Candidate
+	status    status              // Leader, Follower, Candidate
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -103,6 +122,61 @@ type Raft struct {
 	// notifies that a heartbeat from the leader has arrived
 	heartbeatCh   chan struct{}
 	voteRequestCh chan struct{}
+}
+
+func (rf *Raft) handleEvent(ctx context.Context, e event, data int) status {
+	log.Printf("%d Handling event: %s at term %d\n", rf.me, e, rf.currentTerm)
+
+	switch rf.status {
+	case UNDEFINED:
+		if e == STARTED {
+			rf.status = FOLLOWER
+			log.Printf("%d: UNDEFINED => STARTED\n", rf.me)
+			// start ticker goroutine to start elections
+			go rf.ticker()
+		}
+	case FOLLOWER:
+		if e == ELECTION_TIMEOUTED {
+			log.Printf("%d: FOLLOWER => CANDIDATE\n", rf.me)
+			rf.status = CANDIDATE
+			go rf.startElection(context.TODO())
+		} else if e == HIGHER_TERM_FOUND {
+			log.Printf("%d: FOLLOWER => FOLLOWER\n", rf.me)
+			rf.handleHigherTermFound(data)
+		}
+	case CANDIDATE:
+		if e == MAJOR_VOTES_RECEIVED {
+			log.Printf("%d: CANDIDATE => LEADER\n", rf.me)
+			rf.status = LEADER
+			// send heart beat as new leader
+			go rf.sendHeartBeat(ctx)
+		} else if e == CURRENT_LEADER_FOUND {
+			log.Printf("%d: CANDIDATE => FOLLOWER\n", rf.me)
+			rf.status = FOLLOWER
+		} else if e == HIGHER_TERM_FOUND {
+			log.Printf("%d: CANDIDATE => FOLLOWER\n", rf.me)
+			rf.handleHigherTermFound(data)
+		} else if e == ELECTION_TIMEOUTED {
+			log.Printf("%d: CANDIDATE => CANDIDATE\n", rf.me)
+			go rf.startElection(context.TODO())
+		}
+	case LEADER:
+		if e == HIGHER_TERM_FOUND {
+			log.Printf("%d: LEADER => FOLLOWER\n", rf.me)
+			rf.handleHigherTermFound(data)
+		}
+	}
+
+	return rf.status
+}
+
+func (rf *Raft) handleHigherTermFound(term int) {
+	// update term
+
+	rf.status = FOLLOWER
+	rf.currentTerm = term
+	// since we updated term, we reset votedFor; we haven't voted for anyone in this new term (yet)
+	rf.votedFor = -1
 }
 
 // return currentTerm and whether this server
@@ -117,8 +191,8 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	log.Println("acquired lock in GetState...")
 	term = rf.currentTerm
+	isleader = (rf.status == LEADER)
 	rf.mu.Unlock()
-	isleader = rf.currentStatus() == Leader
 	log.Println("GetState called finished")
 
 	return term, isleader
@@ -237,12 +311,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
-	} else if args.Term > rf.currentTerm {
-		// update term
-		rf.currentTerm = args.Term
-		rf.updateStatus(Follower)
-		// since we updated term, we reset votedFor; we haven't voted for anyone in this new term (yet)
-		rf.votedFor = -1
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.handleEvent(context.TODO(), HIGHER_TERM_FOUND, args.Term)
 	}
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
@@ -319,12 +391,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// the appendEntry came from an legitimate leader
-	// TODO: > ? >=?
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.updateStatus(Follower)
-		rf.votedFor = -1
+		rf.handleEvent(context.TODO(), HIGHER_TERM_FOUND, args.Term)
 	}
 
 	// 2. if log doesn't contain an entry at prevLogIndex...
@@ -406,10 +474,12 @@ func (rf *Raft) ticker() {
 		r := ElectionTimeOutMin + rand.Intn(ElectionTimeOutMax-ElectionTimeOutMin+1)
 		t := time.Duration(r) * time.Millisecond
 		// r can be infinite if leader
-		if rf.currentStatus() == Leader {
+		rf.mu.Lock()
+		if rf.status == LEADER {
 			// 300 years
 			t = time.Duration(math.MaxInt64)
 		}
+		rf.mu.Unlock()
 
 		select {
 		case <-rf.heartbeatCh:
@@ -417,12 +487,10 @@ func (rf *Raft) ticker() {
 		case <-rf.voteRequestCh:
 			log.Printf("%d received voterequest before election timeout\n", rf.me)
 		case <-time.After(t):
-			// start election
-			// i am a new candidate, or was a candidate
-			rf.updateStatus(Candidate)
-			log.Printf("%d: start election after %d(ms)\n", rf.me, r)
 			// TODO: cancel election if receiving heartbeat
-			go rf.startElection(context.TODO())
+			rf.mu.Lock()
+			rf.handleEvent(context.TODO(), ELECTION_TIMEOUTED, 0)
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -447,8 +515,6 @@ func (rf *Raft) startElection(ctx context.Context) {
 
 	replyCh := rf.requestVoteToPeers(ctx, &req)
 
-	log.Printf("%d counting votes\n", rf.me)
-
 	votes := 1 // includes my vote
 	// for each incoming vote replies
 	for reply := range replyCh {
@@ -471,28 +537,23 @@ func (rf *Raft) startElection(ctx context.Context) {
 		// we leave the replyCh open, so that the broadcasting go routine can close it
 		if votes > len(rf.peers)/2 {
 			log.Printf("%d recieved %d / %d votes\n", rf.me, votes, len(rf.peers))
-			break
+			rf.mu.Lock()
+			rf.handleEvent(context.TODO(), MAJOR_VOTES_RECEIVED, 0)
+			rf.mu.Unlock()
+			return
 		}
 	}
-
-	log.Printf("%d trying to become a leader...\n", rf.me)
-	succ := rf.tryUpdateStatus(Candidate, Leader)
-	if !succ {
-		// TODO: give up earlier
-		log.Printf("%d is not a candidate anymore; give up election", rf.me)
-		return
-	}
-	log.Printf("%d became a leader!\n", rf.me)
-
-	// send empty appendEntry as a heartbeat to peers, as a new leader
-	go rf.sendHeartBeat(ctx)
 }
 
 func (rf *Raft) sendHeartBeat(ctx context.Context) {
 
-	for rf.currentStatus() == Leader {
+	for {
 
 		rf.mu.Lock()
+		if rf.status != LEADER {
+			rf.mu.Unlock()
+			break
+		}
 		req := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
@@ -522,10 +583,8 @@ func (rf *Raft) handleAppendEntryReplies(replyCh chan *AppendEntriesReply) {
 		}
 
 		// update term
-		if rf.currentTerm < reply.Term {
-			rf.currentTerm = reply.Term
-			rf.votedFor = -1
-			rf.updateStatus(Follower)
+		if reply.Term > rf.currentTerm {
+			rf.handleEvent(context.TODO(), HIGHER_TERM_FOUND, reply.Term)
 		}
 		rf.mu.Unlock()
 	}
@@ -592,27 +651,6 @@ func (rf *Raft) requestVoteToPeers(ctx context.Context, req *RequestVoteArgs) ch
 	return replyCh
 }
 
-func (rf *Raft) currentStatus() int32 {
-	return atomic.LoadInt32(&rf.status)
-}
-
-func (rf *Raft) updateStatus(status int32) {
-	if status == Leader {
-		log.Printf("%d updating its status to leader\n", rf.me)
-	}
-	if status == Candidate {
-		log.Printf("%d updating its status to candidate\n", rf.me)
-	}
-	if status == Follower {
-		log.Printf("%d updating its status to follower\n", rf.me)
-	}
-	atomic.StoreInt32(&rf.status, status)
-}
-
-func (rf *Raft) tryUpdateStatus(old int32, new int32) bool {
-	return atomic.CompareAndSwapInt32(&rf.status, old, new)
-}
-
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -634,8 +672,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	// servers start as followers
-	rf.status = Follower
 
 	// a dummy log to make getting lastLogIndex and Term easier
 	sentinelLog := Log{Term: 0}
@@ -646,8 +682,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// start ticker goroutine to start elections
-	go rf.ticker()
+	rf.handleEvent(context.TODO(), STARTED, 0)
 
 	return rf
 }
