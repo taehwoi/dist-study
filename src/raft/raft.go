@@ -98,7 +98,7 @@ type Log struct {
 func (l Log) String() string {
 
 	return fmt.Sprintf(
-		"Log{Term: %d, Index: %d, Command: %v}",
+		"Log{T: %d, I: %d, C: %v}",
 		l.Term, l.Index, l.Command)
 }
 
@@ -143,6 +143,8 @@ type Raft struct {
 	voteRequestCh chan struct{}
 
 	applyCh chan ApplyMsg
+
+	lastNewEntryIndex int
 }
 
 func (rf *Raft) handleEvent(ctx context.Context, e event, data int) status {
@@ -179,7 +181,6 @@ func (rf *Raft) handleEvent(ctx context.Context, e event, data int) status {
 			for idx := range rf.matchIndex {
 				rf.matchIndex[idx] = 0
 			}
-
 			// send heart beat as new leader
 			go rf.sendHeartBeat(ctx)
 		} else if e == CURRENT_LEADER_FOUND {
@@ -321,7 +322,7 @@ type AppendEntriesArgs struct {
 
 func (a AppendEntriesArgs) String() string {
 	return fmt.Sprintf(
-		"AppendEntriesArgs{Term: %d, LeaderId: %d, PrevLogIndex: %d, PrevLogTerm: %d, Entries: %v, LeaderCommit: %d}",
+		"AppendEntriesArgs{T: %d, L: %d, PLI: %d, PLT %d, E: %v, LC: %d}",
 		a.Term, a.LeaderId, a.PrevLogIndex, a.PrevLogTerm, a.Entries, a.LeaderCommit)
 }
 
@@ -431,10 +432,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// TODO: should this code check if the appendEntry request is from a valid leader? <- YES
 	// received heartbeat
-	rf.heartbeatCh <- struct{}{}
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	if args.Term >= rf.currentTerm {
+		log.Printf("%d received valid heartbeat\n", rf.me)
+		// received heartbeat
+		rf.heartbeatCh <- struct{}{}
+	}
+
+	log.Printf("%d's current logs: %v", rf.me, rf.logs)
 
 	reply.Term = rf.currentTerm
 
@@ -472,25 +480,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
-	newEntries := make([]*Log, 0)
 	for _, val := range args.Entries {
 		if val.Index > len(rf.logs) {
+			log.Printf("%d appending %v to %v", rf.me, val, rf.logs)
 			rf.logs = append(rf.logs, val)
-			newEntries = append(rf.logs, val)
+			rf.lastNewEntryIndex = val.Index
+			log.Printf("%d lastNewEntryINdex %d", rf.me, rf.lastNewEntryIndex)
 		}
 	}
 
 	log.Printf("%d added args.Entries %v to its logs %v", rf.me, args.Entries, rf.logs)
 
+	//TODO: fixme
 	if args.LeaderCommit > rf.commitIndex {
-		log.Printf("%d leader commit updated", rf.me)
-		var lastNewEntryIndex int
-		if len(newEntries) == 0 {
-			lastNewEntryIndex = 999999999999
-		} else {
-			lastNewEntryIndex = newEntries[len(newEntries)-1].Index
-		}
-		rf.commitIndex = Min(args.LeaderCommit, lastNewEntryIndex)
+		log.Printf("%d leader commit updated %d, %d", rf.me, args.LeaderCommit, rf.commitIndex)
+		rf.commitIndex = Min(args.LeaderCommit, rf.lastNewEntryIndex)
 		log.Printf("%d new commit index %d", rf.me, rf.commitIndex)
 		rf.handleCommit(rf.commitIndex)
 	}
@@ -523,6 +527,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 
+	log.Printf("%d received command %v", rf.me, command)
 	entry := &Log{
 		Term:    term,
 		Index:   index,
@@ -551,9 +556,9 @@ func (rf *Raft) beginEntriesAgreement(server int) {
 
 	log.Printf("%d, beginEntriesAgreement NextIndex: %v", rf.me, rf.nextIndex)
 
-	log.Printf("NextIndex: %v", rf.nextIndex[server])
-	log.Printf("MatchIndex: %v", rf.matchIndex[server])
-	log.Printf("Logs: %v", rf.logs)
+	log.Printf("%d=>%d NextIndex: %v", rf.me, server, rf.nextIndex[server])
+	log.Printf("%d=>%d MatchIndex: %v", rf.me, server, rf.matchIndex[server])
+	log.Printf("%d Logs: %v", rf.me, rf.logs)
 
 	lastLogIndex := len(rf.logs)
 
@@ -584,7 +589,6 @@ func (rf *Raft) beginEntriesAgreement(server int) {
 			LeaderCommit: rf.commitIndex,
 		}
 
-		log.Printf("%v", *req)
 		go rf.sendAppendEntriesToPeer(context.TODO(), req, server)
 	}
 }
@@ -643,45 +647,44 @@ func (rf *Raft) ticker() {
 func (rf *Raft) sendHeartBeat(ctx context.Context) {
 
 	for {
+		for server := range rf.peers {
+			if server == rf.me {
+				continue
+			}
 
-		rf.mu.Lock()
-		if rf.status != LEADER {
+			rf.mu.Lock()
+			if rf.status != LEADER {
+				rf.mu.Unlock()
+				return
+			}
+
+			next := rf.nextIndex[server]
+
+			var prevLogIndex int
+			var prevLogTerm int
+
+			if next == 1 {
+				prevLogIndex = 0
+				prevLogTerm = -1
+			} else {
+				prevLogIndex = rf.logs[next-2].Index
+				prevLogTerm = rf.logs[next-2].Term
+			}
+			req := &AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      []*Log{},
+				LeaderCommit: rf.commitIndex,
+			}
 			rf.mu.Unlock()
-			break
+
+			go rf.sendAppendEntriesToPeer(ctx, req, server)
 		}
-
-		prevLogIndex := len(rf.logs)
-		var prevLogTerm int
-		if prevLogIndex == 0 {
-			prevLogTerm = -1
-		} else {
-			prevLogTerm = rf.logs[prevLogIndex-1].Term
-		}
-
-		req := &AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  prevLogTerm,
-			Entries:      []*Log{},
-			LeaderCommit: rf.commitIndex,
-		}
-		rf.mu.Unlock()
-
-		go rf.sendAppendEntriesToPeers(ctx, req)
-
 		time.Sleep(200 * time.Millisecond)
 	}
 
-}
-
-func (rf *Raft) sendAppendEntriesToPeers(ctx context.Context, req *AppendEntriesArgs) {
-
-	for server := range rf.peers {
-		if server != rf.me {
-			go rf.sendAppendEntriesToPeer(ctx, req, server)
-		}
-	}
 }
 
 func (rf *Raft) sendAppendEntriesToPeer(ctx context.Context, req *AppendEntriesArgs, server int) {
@@ -689,6 +692,10 @@ func (rf *Raft) sendAppendEntriesToPeer(ctx context.Context, req *AppendEntriesA
 
 	if ok := rf.sendAppendEntries(ctx, server, req, &reply); !ok {
 		log.Println("failed rpc request for append entry")
+		//retry
+		time.Sleep(300 * time.Millisecond)
+		go rf.sendAppendEntriesToPeer(ctx, req, server)
+		return
 	}
 
 	rf.mu.Lock()
@@ -707,7 +714,8 @@ func (rf *Raft) sendAppendEntriesToPeer(ctx context.Context, req *AppendEntriesA
 	}
 
 	if reply.Success {
-		log.Printf("%d append Entry request was successful\n", rf.me)
+		log.Printf("%d => %d append Entry request to was successful\n", rf.me, server)
+		log.Printf("%d matchIndex before %v, nextIndex before %v", rf.me, rf.matchIndex, rf.nextIndex)
 		rf.matchIndex[server] = req.PrevLogIndex + len(req.Entries)
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 		log.Printf("%d matchIndex updated to %v, nextIndex updated to %v", rf.me, rf.matchIndex, rf.nextIndex)
@@ -732,7 +740,7 @@ func (rf *Raft) tryApply() {
 				count++
 			}
 		}
-		if count > major && rf.logs[N-1].Term == rf.currentTerm {
+		if count >= major && rf.logs[N-1].Term == rf.currentTerm {
 			rf.commitIndex = N
 			log.Printf("%d found a suitable N: %d", rf.me, N)
 			rf.handleCommit(rf.commitIndex)
@@ -746,9 +754,11 @@ func (rf *Raft) handleCommit(commitIndex int) {
 	log.Printf("%d trying to grab lock for commit", rf.me)
 	// rf.mu.Lock()
 	// defer rf.mu.Unlock()
-	log.Printf("%d tryint go commit", rf.me)
-	for ; rf.lastApplied < commitIndex; rf.lastApplied++ {
-		l := rf.logs[rf.lastApplied]
+	log.Printf("%d trying to commit: %d, %d", rf.me, rf.lastApplied, rf.commitIndex)
+	log.Printf("%d trying to commit: %v", rf.me, rf.logs)
+	for rf.lastApplied < commitIndex {
+		rf.lastApplied++
+		l := rf.logs[rf.lastApplied-1]
 		msg := ApplyMsg{
 			CommandValid: true,
 			Command:      l.Command,
