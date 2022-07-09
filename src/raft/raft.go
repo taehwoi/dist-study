@@ -22,6 +22,7 @@ import (
 
 	"context"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
@@ -442,7 +443,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.heartbeatCh <- struct{}{}
 	}
 
-	log.Printf("%d's current logs: %v", rf.me, rf.logs)
+	log.Printf("%d, args: %v", rf.me, args)
+	log.Printf("%d's current logs: %v, pli: %d", rf.me, rf.logs, args.PrevLogIndex)
 
 	reply.Term = rf.currentTerm
 
@@ -459,14 +461,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex == 0 && args.PrevLogTerm == -1 {
 		reply.Success = true
 	}
+	if args.PrevLogIndex > len(rf.logs) {
+		reply.Success = false
+		return
+	}
 	// 2. if log doesn't contain an entry at prevLogIndex...
-	if args.PrevLogIndex < len(rf.logs) && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+	if args.PrevLogIndex > 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
 		reply.Success = false
 		return
 	}
 
 	reply.Success = true
 
+	//FIXME!
 	for _, val := range args.Entries {
 		if val.Index > len(rf.logs) {
 			break //FIXME?
@@ -626,7 +633,7 @@ func (rf *Raft) ticker() {
 		if rf.status == LEADER {
 			// 300 years
 			t = time.Duration(math.MaxInt64)
-			fmt.Printf("setting a large timer %d", t)
+			log.Printf("setting a large timer %d", t)
 		}
 		rf.mu.Unlock()
 
@@ -693,7 +700,7 @@ func (rf *Raft) sendAppendEntriesToPeer(ctx context.Context, req *AppendEntriesA
 	if ok := rf.sendAppendEntries(ctx, server, req, &reply); !ok {
 		log.Println("failed rpc request for append entry")
 		//retry
-		time.Sleep(300 * time.Millisecond)
+		<-time.After(300 * time.Millisecond)
 		go rf.sendAppendEntriesToPeer(ctx, req, server)
 		return
 	}
@@ -905,4 +912,9 @@ func (rf *Raft) requestVoteToPeers(ctx context.Context, req *RequestVoteArgs) ch
 	}()
 
 	return replyCh
+}
+
+func init() {
+	log.SetOutput(ioutil.Discard)
+	log.SetFlags(0)
 }
