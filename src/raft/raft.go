@@ -518,9 +518,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.handleEvent(context.TODO(), HIGHER_TERM_FOUND, args.Term)
 	}
 
-	if args.PrevLogIndex == 0 && args.PrevLogTerm == -1 {
-		reply.Success = true
-	}
 	if args.PrevLogIndex > len(rf.logs) {
 		reply.Success = false
 		return
@@ -561,9 +558,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//TODO: fixme
 	if args.LeaderCommit > rf.commitIndex {
 		log.Printf("%d leader commit updated %d, %d, %d", rf.me, args.LeaderCommit, rf.commitIndex, rf.lastNewEntryIndex)
+		prev := rf.commitIndex
 		rf.commitIndex = Min(args.LeaderCommit, rf.lastNewEntryIndex)
 		log.Printf("%d new commit index %d", rf.me, rf.commitIndex)
-		rf.handleCommit(rf.commitIndex)
+		if prev != rf.commitIndex {
+			go rf.handleCommit(rf.commitIndex)
+		}
 	}
 
 }
@@ -638,9 +638,7 @@ func (rf *Raft) beginEntriesAgreement(ctx context.Context, server int) {
 		entries := make([]*Log, 0)
 
 		next := rf.nextIndex[server]
-		for i := next; i <= len(rf.logs); i++ {
-			entries = append(entries, rf.logs[i-1])
-		}
+		entries = append(entries, rf.logs[next-1:]...)
 
 		var prevLogIndex int
 		var prevLogTerm int

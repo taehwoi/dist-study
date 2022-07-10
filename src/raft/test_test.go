@@ -591,7 +591,7 @@ func TestBackup2B(t *testing.T) {
 
 	cfg.one(rand.Int(), servers, true)
 
-	fmt.Println("put leader and one follower in a partition")
+	// fmt.Println("put leader and one follower in a partition")
 
 	// put leader and one follower in a partition
 	leader1 := cfg.checkOneLeader()
@@ -603,40 +603,40 @@ func TestBackup2B(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader1].Start(rand.Int())
 	}
-	fmt.Println("lots of commands submitted")
+	// fmt.Println("lots of commands submitted")
 
-	fmt.Printf("check (0)\n")
-	for server, val := range cfg.rafts {
-		val.mu.Lock()
-		fmt.Printf("%v: %d's logs: %v\n", val.status, server, val.logs)
+	// fmt.Printf("check (0)\n")
+	// for server, val := range cfg.rafts {
+	// 	val.mu.Lock()
+	// 	fmt.Printf("%v: %d's logs: %v\n", val.status, server, val.logs)
 
-		val.mu.Unlock()
-	}
+	// 	val.mu.Unlock()
+	// }
 
 	time.Sleep(RaftElectionTimeout / 2)
 
 	cfg.disconnect((leader1 + 0) % servers)
 	cfg.disconnect((leader1 + 1) % servers)
 
-	fmt.Println("allow other partition to recover")
+	// fmt.Println("allow other partition to recover")
 	// allow other partition to recover
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
 
-	fmt.Println("lots of success ful commands submitted")
+	// fmt.Println("lots of success ful commands submitted")
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
 
-	fmt.Printf("check (0)\n")
-	for server, val := range cfg.rafts {
-		val.mu.Lock()
-		fmt.Printf("%v: %d's logs: %v\n", val.status, server, val.logs)
+	// fmt.Printf("check (0)\n")
+	// for server, val := range cfg.rafts {
+	// 	val.mu.Lock()
+	// 	fmt.Printf("%v: %d's logs: %v\n", val.status, server, val.logs)
 
-		val.mu.Unlock()
-	}
+	// 	val.mu.Unlock()
+	// }
 
 	// now another partitioned leader and one follower
 	leader2 := cfg.checkOneLeader()
@@ -667,13 +667,13 @@ func TestBackup2B(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
-	fmt.Printf("check abcd\n")
-	for server, val := range cfg.rafts {
-		val.mu.Lock()
-		fmt.Printf("%v: %d's logs: %v\n", val.status, server, val.logs)
+	// fmt.Printf("check abcd\n")
+	// for server, val := range cfg.rafts {
+	// 	val.mu.Lock()
+	// 	fmt.Printf("%v: %d's logs: %v\n", val.status, server, val.logs)
 
-		val.mu.Unlock()
-	}
+	// 	val.mu.Unlock()
+	// }
 
 	// now everyone
 	for i := 0; i < servers; i++ {
