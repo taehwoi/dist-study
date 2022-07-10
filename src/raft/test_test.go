@@ -326,6 +326,8 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.disconnect((leader + 2) % servers)
 	cfg.disconnect((leader + 3) % servers)
 
+	fmt.Println("after followers disconnect")
+
 	index, _, ok := cfg.rafts[leader].Start(20)
 	if ok != true {
 		t.Fatalf("leader rejected Start()")
@@ -341,10 +343,12 @@ func TestFailNoAgree2B(t *testing.T) {
 		t.Fatalf("%v committed but no majority", n)
 	}
 
+	fmt.Println("start followers repair")
 	// repair
 	cfg.connect((leader + 1) % servers)
 	cfg.connect((leader + 2) % servers)
 	cfg.connect((leader + 3) % servers)
+	fmt.Println("followers repaired")
 
 	// the disconnected majority may have chosen a leader from
 	// among their own ranks, forgetting index 2.
@@ -355,6 +359,13 @@ func TestFailNoAgree2B(t *testing.T) {
 	}
 	if index2 < 2 || index2 > 3 {
 		t.Fatalf("unexpected index %v", index2)
+	}
+	fmt.Println("can agree on 1000?")
+	for server, val := range cfg.rafts {
+		val.mu.Lock()
+		fmt.Printf("%d's logs: %v\n", server, val.logs)
+
+		val.mu.Unlock()
 	}
 
 	cfg.one(1000, servers, true)
@@ -384,6 +395,14 @@ loop:
 			continue
 		}
 
+		fmt.Printf("check (1)\n")
+		for server, val := range cfg.rafts {
+			val.mu.Lock()
+			fmt.Printf("%d's logs: %v\n", server, val.logs)
+
+			val.mu.Unlock()
+		}
+
 		iters := 5
 		var wg sync.WaitGroup
 		is := make(chan int, iters)
@@ -405,11 +424,28 @@ loop:
 		wg.Wait()
 		close(is)
 
+		fmt.Printf("check (2)\n")
+		for server, val := range cfg.rafts {
+			val.mu.Lock()
+			fmt.Printf("%d's logs: %v\n", server, val.logs)
+
+			val.mu.Unlock()
+		}
+
 		for j := 0; j < servers; j++ {
+			fmt.Printf("trying to getState of %d\n", j)
 			if t, _ := cfg.rafts[j].GetState(); t != term {
 				// term changed -- can't expect low RPC counts
 				continue loop
 			}
+		}
+
+		fmt.Printf("check (3)\n")
+		for server, val := range cfg.rafts {
+			val.mu.Lock()
+			fmt.Printf("%d's logs: %v\n", server, val.logs)
+
+			val.mu.Unlock()
 		}
 
 		failed := false
@@ -428,6 +464,14 @@ loop:
 			} else {
 				t.Fatalf("value %v is not an int", cmd)
 			}
+		}
+
+		fmt.Printf("check (4)\n")
+		for server, val := range cfg.rafts {
+			val.mu.Lock()
+			fmt.Printf("%d's logs: %v\n", server, val.logs)
+
+			val.mu.Unlock()
 		}
 
 		if failed {

@@ -223,7 +223,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	log.Printf("%d trying to acquire lock in GetState...\n", rf.me)
 	rf.mu.Lock()
-	log.Println("acquired lock in GetState...")
+	log.Printf("%d acquired lock in GetState...", rf.me)
 	term = rf.currentTerm
 	isleader = (rf.status == LEADER)
 	rf.mu.Unlock()
@@ -440,7 +440,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term >= rf.currentTerm {
 		log.Printf("%d received valid heartbeat\n", rf.me)
 		// received heartbeat
-		rf.heartbeatCh <- struct{}{}
+		go func() {
+			rf.heartbeatCh <- struct{}{}
+		}()
 	}
 
 	log.Printf("%d, args: %v", rf.me, args)
@@ -482,7 +484,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.logs[val.Index-1].Term != val.Term {
 			// delete the existing entry and all that follow it
 			// by only retaining the entries before it
-			rf.logs = rf.logs[:val.Index-2]
+			rf.logs = rf.logs[:val.Index-1]
 			break
 		}
 	}
@@ -723,12 +725,16 @@ func (rf *Raft) sendAppendEntriesToPeer(ctx context.Context, req *AppendEntriesA
 	if reply.Success {
 		log.Printf("%d => %d append Entry request to was successful\n", rf.me, server)
 		log.Printf("%d matchIndex before %v, nextIndex before %v", rf.me, rf.matchIndex, rf.nextIndex)
+		prev := rf.matchIndex[server]
 		rf.matchIndex[server] = req.PrevLogIndex + len(req.Entries)
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
-		log.Printf("%d matchIndex updated to %v, nextIndex updated to %v", rf.me, rf.matchIndex, rf.nextIndex)
-		go rf.tryApply()
+		if prev != rf.matchIndex[server] {
+			log.Printf("%d matchIndex updated to %v, nextIndex updated to %v", rf.me, rf.matchIndex, rf.nextIndex)
+			//TODO: tryapply only when changed
+			go rf.tryApply()
+		}
 	} else {
-		rf.matchIndex[server]--
+		rf.nextIndex[server]--
 		//retry
 		go rf.beginEntriesAgreement(server)
 	}
@@ -785,6 +791,7 @@ func (rf *Raft) sendAppendEntries(ctx context.Context,
 	log.Printf("%d send append entry to %d, %v\n", rf.me, server, *args)
 
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	log.Printf("%d received %t", rf.me, ok)
 	return ok
 }
 
