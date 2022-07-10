@@ -27,7 +27,6 @@ import (
 	"math"
 	"math/rand"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	//	"6.824/labgob"
@@ -137,7 +136,6 @@ type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
 	status    status              // Leader, Follower, Candidate
 
 	// Your data here (2A, 2B, 2C).
@@ -160,6 +158,13 @@ type Raft struct {
 	applyCh chan ApplyMsg
 
 	lastNewEntryIndex int
+
+	mainCancelFunc   func()
+	leaderCancelFunc func()
+	leaderContext    context.Context
+
+	followerContext    context.Context
+	followerCancelFunc func()
 }
 
 func (rf *Raft) handleEvent(ctx context.Context, e event, data int) status {
@@ -171,12 +176,13 @@ func (rf *Raft) handleEvent(ctx context.Context, e event, data int) status {
 			rf.status = FOLLOWER
 			log.Printf("%d: UNDEFINED => STARTED\n", rf.me)
 			// start ticker goroutine to start elections
-			go rf.ticker()
+			go rf.ticker(ctx)
 		}
 	case FOLLOWER:
 		if e == ELECTION_TIMEOUTED {
 			log.Printf("%d: FOLLOWER => CANDIDATE\n", rf.me)
 			rf.status = CANDIDATE
+			rf.followerContext, rf.followerCancelFunc = context.WithCancel(ctx)
 			go rf.startElection(context.TODO())
 		} else if e == HIGHER_TERM_FOUND {
 			log.Printf("%d: FOLLOWER => FOLLOWER\n", rf.me)
@@ -186,6 +192,8 @@ func (rf *Raft) handleEvent(ctx context.Context, e event, data int) status {
 		if e == MAJOR_VOTES_RECEIVED {
 			log.Printf("%d: CANDIDATE => LEADER\n", rf.me)
 			rf.status = LEADER
+			rf.followerCancelFunc()
+			rf.followerContext = nil
 
 			rf.nextIndex = make([]int, len(rf.peers))
 			for idx := range rf.nextIndex {
@@ -196,8 +204,10 @@ func (rf *Raft) handleEvent(ctx context.Context, e event, data int) status {
 			for idx := range rf.matchIndex {
 				rf.matchIndex[idx] = 0
 			}
+			rf.leaderContext, rf.leaderCancelFunc = context.WithCancel(ctx)
+
 			// send heart beat as new leader
-			go rf.sendHeartBeat(ctx)
+			go rf.sendHeartBeat(rf.leaderContext)
 
 			// start begin entries for once
 			// for server := range rf.peers {
@@ -207,20 +217,28 @@ func (rf *Raft) handleEvent(ctx context.Context, e event, data int) status {
 			// }
 		} else if e == CURRENT_LEADER_FOUND {
 			log.Printf("%d: CANDIDATE => FOLLOWER\n", rf.me)
+			rf.followerCancelFunc()
+			rf.followerContext = nil
 			rf.status = FOLLOWER
 		} else if e == HIGHER_TERM_FOUND {
 			log.Printf("%d: CANDIDATE => FOLLOWER\n", rf.me)
+			rf.followerCancelFunc()
+			rf.followerContext = nil
 			rf.handleHigherTermFound(data)
 		} else if e == ELECTION_TIMEOUTED {
 			log.Printf("%d: CANDIDATE => CANDIDATE\n", rf.me)
-			go rf.startElection(context.TODO())
+			go rf.startElection(ctx)
 		}
 	case LEADER:
 		if e == HIGHER_TERM_FOUND {
 			log.Printf("%d: LEADER => FOLLOWER\n", rf.me)
+			rf.leaderCancelFunc()
+			rf.leaderContext = nil
 			rf.handleHigherTermFound(data)
 		} else if e == CURRENT_LEADER_FOUND {
 			log.Printf("%d: LEADER => FOLLOWER\n", rf.me)
+			rf.leaderCancelFunc()
+			rf.leaderContext = nil
 			rf.status = FOLLOWER
 		}
 	}
@@ -585,28 +603,29 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.logs = append(rf.logs, entry)
 
+	rf.mu.Unlock()
 	for server := range rf.peers {
 		if server != rf.me {
 
-			go rf.beginEntriesAgreement(server)
+			go rf.beginEntriesAgreement(rf.leaderContext, server)
 		}
 	}
-	rf.mu.Unlock()
 
 	// Your code here (2B).
 
 	return index, term, isLeader
 }
 
-func (rf *Raft) beginEntriesAgreement(server int) {
+func (rf *Raft) beginEntriesAgreement(ctx context.Context, server int) {
+
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//TODO: use cancel
-	if rf.status != LEADER {
-		return
-	}
-
 	log.Printf("%d, beginEntriesAgreement NextIndex: %v", rf.me, rf.nextIndex)
 
 	log.Printf("%d=>%d NextIndex: %v", rf.me, server, rf.nextIndex[server])
@@ -641,7 +660,7 @@ func (rf *Raft) beginEntriesAgreement(server int) {
 			PrevLogTerm:  prevLogTerm,
 			LeaderCommit: rf.commitIndex,
 		}
-		go rf.sendAppendEntriesToPeer(context.TODO(), req, server)
+		go rf.sendAppendEntriesToPeer(ctx, req, server)
 	}
 }
 
@@ -657,20 +676,13 @@ func (rf *Raft) beginEntriesAgreement(server int) {
 // should call killed() to check whether it should stop.
 //
 func (rf *Raft) Kill() {
-	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
-	// TODO: use context to cancel all running goroutines
-}
-
-func (rf *Raft) killed() bool {
-	z := atomic.LoadInt32(&rf.dead)
-	return z == 1
+	rf.mainCancelFunc()
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
-func (rf *Raft) ticker() {
-	for !rf.killed() {
+func (rf *Raft) ticker(ctx context.Context) {
+	for {
 		r := ElectionTimeOutMin + rand.Intn(ElectionTimeOutMax-ElectionTimeOutMin+1)
 		t := time.Duration(r) * time.Millisecond
 		// r can be infinite if leader
@@ -690,8 +702,10 @@ func (rf *Raft) ticker() {
 		case <-time.After(t):
 			// TODO: cancel election if receiving heartbeat
 			rf.mu.Lock()
-			rf.handleEvent(context.TODO(), ELECTION_TIMEOUTED, 0)
+			rf.handleEvent(ctx, ELECTION_TIMEOUTED, 0)
 			rf.mu.Unlock()
+		case <-ctx.Done():
+			return
 		}
 	}
 }
@@ -710,6 +724,7 @@ func (rf *Raft) sendHeartBeat(ctx context.Context) {
 			var prevLogIndex int
 			var prevLogTerm int
 
+			log.Printf("%d, next: %d", rf.me, next)
 			if next == 1 {
 				prevLogIndex = 0
 				prevLogTerm = -1
@@ -726,15 +741,15 @@ func (rf *Raft) sendHeartBeat(ctx context.Context) {
 				LeaderCommit: rf.commitIndex,
 			}
 
-			if rf.status == LEADER {
-				go rf.sendAppendEntriesToPeer(ctx, req, server)
-				rf.mu.Unlock()
-			} else {
-				rf.mu.Unlock()
-				return
-			}
+			go rf.sendAppendEntriesToPeer(ctx, req, server)
+			rf.mu.Unlock()
+
 		}
-		<-time.After(200 * time.Millisecond)
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-ctx.Done():
+			return
+		}
 	}
 
 }
@@ -742,24 +757,31 @@ func (rf *Raft) sendHeartBeat(ctx context.Context) {
 func (rf *Raft) sendAppendEntriesToPeer(ctx context.Context, req *AppendEntriesArgs, server int) {
 	reply := AppendEntriesReply{}
 
-	// TODO: use context.cancel
-	rf.mu.Lock()
-	if rf.status != LEADER {
-		rf.mu.Unlock()
+	select {
+	case <-ctx.Done():
 		return
+	default:
 	}
-	rf.mu.Unlock()
 
 	if ok := rf.sendAppendEntries(ctx, server, req, &reply); !ok {
 		log.Printf("%d failed rpc request %v to server %d for append entry", rf.me, req, server)
 		//retry
-		<-time.After(300 * time.Millisecond)
-		go rf.sendAppendEntriesToPeer(ctx, req, server)
-		return
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(300 * time.Millisecond):
+			go rf.sendAppendEntriesToPeer(ctx, req, server)
+		}
 	}
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	if rf.currentTerm > req.Term {
+		log.Printf("%d received an old reply\n", rf.me)
+		return
+
+	}
 
 	if rf.currentTerm > reply.Term {
 		log.Printf("%d received an old reply\n", rf.me)
@@ -787,7 +809,13 @@ func (rf *Raft) sendAppendEntriesToPeer(ctx context.Context, req *AppendEntriesA
 	} else {
 		rf.nextIndex[server]--
 		//retry
-		go rf.beginEntriesAgreement(server)
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			go rf.beginEntriesAgreement(rf.leaderContext, server)
+		}
+
 	}
 }
 
@@ -868,9 +896,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 
-	// a dummy log to make getting lastLogIndex and Term easier
-	// sentinelLog := Log{Term: 0}
-	// rf.logs = []*Log{&sentinelLog}
 	rf.heartbeatCh = make(chan struct{})
 	rf.voteRequestCh = make(chan struct{})
 
@@ -879,8 +904,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	rf.mainCancelFunc = cancelFunc
+	rf.leaderCancelFunc = func() {}
+
 	rf.mu.Lock()
-	rf.handleEvent(context.TODO(), STARTED, 0)
+	rf.handleEvent(ctx, STARTED, 0)
 	rf.mu.Unlock()
 
 	return rf
@@ -950,7 +979,6 @@ func (rf *Raft) requestVoteToPeers(ctx context.Context, req *RequestVoteArgs) ch
 	replyCh := make(chan *RequestVoteReply, len(rf.peers)-1)
 
 	eg, _ := errgroup.WithContext(ctx)
-	eg.SetLimit(len(rf.peers) - 1)
 	for idx := range rf.peers {
 		server := idx
 		if server != rf.me {

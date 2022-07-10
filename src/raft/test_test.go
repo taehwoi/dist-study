@@ -121,6 +121,14 @@ func TestManyElections2A(t *testing.T) {
 		cfg.connect(i3)
 	}
 
+	fmt.Printf("check (1)\n")
+	for server, val := range cfg.rafts {
+		val.mu.Lock()
+		fmt.Printf("status: %v, term: %d, %d's logs: %v\n", val.status, val.currentTerm, server, val.logs)
+
+		val.mu.Unlock()
+	}
+
 	cfg.checkOneLeader()
 
 	cfg.end()
