@@ -121,7 +121,6 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 		}
 		return true
 	} else {
-		log.Printf("reply did not come! %s\n", svcMeth)
 		return false
 	}
 }
