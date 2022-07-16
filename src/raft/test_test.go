@@ -804,6 +804,7 @@ func TestPersist12C(t *testing.T) {
 	cfg.one(11, servers, true)
 
 	// crash and re-start all
+	fmt.Printf("crash all")
 	for i := 0; i < servers; i++ {
 		cfg.start1(i, cfg.applier)
 	}
@@ -811,12 +812,15 @@ func TestPersist12C(t *testing.T) {
 		cfg.disconnect(i)
 		cfg.connect(i)
 	}
+	fmt.Printf("restart all")
 
 	cfg.one(12, servers, true)
 
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect(leader1)
+	fmt.Printf("crash leader\n")
 	cfg.start1(leader1, cfg.applier)
+	fmt.Printf("reconnect leader\n")
 	cfg.connect(leader1)
 
 	cfg.one(13, servers, true)
@@ -827,14 +831,19 @@ func TestPersist12C(t *testing.T) {
 	cfg.start1(leader2, cfg.applier)
 	cfg.connect(leader2)
 
+	fmt.Printf("wait for leader2\n")
 	cfg.wait(4, servers, -1) // wait for leader2 to join before killing i3
 
+	fmt.Printf("checkOneLeader before i3\n")
 	i3 := (cfg.checkOneLeader() + 1) % servers
+	fmt.Printf("kill i3\n")
 	cfg.disconnect(i3)
 	cfg.one(15, servers-1, true)
 	cfg.start1(i3, cfg.applier)
+	fmt.Printf("connect i3\n")
 	cfg.connect(i3)
 
+	fmt.Printf("command 16\n")
 	cfg.one(16, servers, true)
 
 	cfg.end()
@@ -1018,6 +1027,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 
 	cfg.begin("Test (2C): Figure 8 (unreliable)")
 
+	fmt.Println("try agreement first")
 	cfg.one(rand.Int()%10000, 1, true)
 
 	nup := servers
@@ -1061,7 +1071,10 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		}
 	}
 
-	cfg.one(rand.Int()%10000, servers, true)
+	x := rand.Int() % 10000
+	fmt.Printf("try agreement second %d\n", x)
+	// cfg.end()
+	cfg.one(x, servers, true)
 
 	cfg.end()
 }
