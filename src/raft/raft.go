@@ -208,6 +208,7 @@ func (rf *Raft) handleEvent(ctx context.Context, e event, data int) status {
 
 			// send heart beat as new leader
 			go rf.sendHeartBeat(rf.leaderContext)
+			go rf.tryApply(rf.leaderContext)
 
 			// start begin entries for once
 			// for server := range rf.peers {
@@ -390,6 +391,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// notify that a vote request has arrived
 	// rf.voteRequestCh <- struct{}{}
 
+	//write lock
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -502,6 +504,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}()
 	}
 
+	if args.Term > rf.currentTerm {
+		rf.handleEvent(context.TODO(), HIGHER_TERM_FOUND, args.Term)
+	}
+
 	log.Printf("%d, args: %v", rf.me, args)
 	log.Printf("%d's current logs: %v, pli: %d", rf.me, rf.logs, args.PrevLogIndex)
 
@@ -512,10 +518,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		log.Printf("reply false because %d has higher term %d than %d", rf.me, rf.currentTerm, args.LeaderId)
 		reply.Success = false
 		return
-	}
-
-	if args.Term > rf.currentTerm {
-		rf.handleEvent(context.TODO(), HIGHER_TERM_FOUND, args.Term)
 	}
 
 	if args.PrevLogIndex > len(rf.logs) {
@@ -555,14 +557,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	log.Printf("%d added args.Entries %v to its logs %v", rf.me, args.Entries, rf.logs)
 
-	//TODO: fixme
 	if args.LeaderCommit > rf.commitIndex {
 		log.Printf("%d leader commit updated %d, %d, %d", rf.me, args.LeaderCommit, rf.commitIndex, rf.lastNewEntryIndex)
 		prev := rf.commitIndex
 		rf.commitIndex = Min(args.LeaderCommit, rf.lastNewEntryIndex)
 		log.Printf("%d new commit index %d", rf.me, rf.commitIndex)
 		if prev != rf.commitIndex {
-			go rf.handleCommit(rf.commitIndex)
+			go rf.tryCommit()
 		}
 	}
 
@@ -624,6 +625,7 @@ func (rf *Raft) beginEntriesAgreement(ctx context.Context, server int) {
 	default:
 	}
 
+	// read lock
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	log.Printf("%d, beginEntriesAgreement NextIndex: %v", rf.me, rf.nextIndex)
@@ -767,8 +769,13 @@ func (rf *Raft) sendAppendEntriesToPeer(ctx context.Context, req *AppendEntriesA
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(300 * time.Millisecond):
-			go rf.sendAppendEntriesToPeer(ctx, req, server)
+		//TODO: why does sleeping here makes it work?
+		case <-time.After(3000 * time.Millisecond):
+			// if not heartbeat, retry
+			if len(req.Entries) != 0 {
+				// go rf.sendAppendEntriesToPeer(ctx, req, server)
+			}
+			return
 		}
 	}
 
@@ -796,54 +803,86 @@ func (rf *Raft) sendAppendEntriesToPeer(ctx context.Context, req *AppendEntriesA
 	if reply.Success {
 		log.Printf("%d => %d append Entry request to was successful\n", rf.me, server)
 		log.Printf("%d matchIndex before %v, nextIndex before %v", rf.me, rf.matchIndex, rf.nextIndex)
-		prev := rf.matchIndex[server]
+		// prev := rf.matchIndex[server]
 		rf.matchIndex[server] = req.PrevLogIndex + len(req.Entries)
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
-		if prev != rf.matchIndex[server] {
-			log.Printf("%d matchIndex updated to %v, nextIndex updated to %v", rf.me, rf.matchIndex, rf.nextIndex)
-			//TODO: tryapply only when changed
-			go rf.tryApply()
-		}
+		// if prev != rf.matchIndex[server] {
+		log.Printf("%d matchIndex updated to %v, nextIndex updated to %v", rf.me, rf.matchIndex, rf.nextIndex)
+		//TODO: tryapply only when changed
+		// go rf.tryApply()
+		// }
 	} else {
 		rf.nextIndex[server]--
+
 		//retry
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			go rf.beginEntriesAgreement(rf.leaderContext, server)
-		}
+			entries := make([]*Log, 0)
 
+			next := rf.nextIndex[server]
+			entries = append(entries, rf.logs[next-1:]...)
+
+			var prevLogIndex int
+			var prevLogTerm int
+
+			if next == 1 {
+				prevLogIndex = 0
+				prevLogTerm = -1
+			} else {
+				prevLogIndex = rf.logs[next-2].Index
+				prevLogTerm = rf.logs[next-2].Term
+			}
+			req := &AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				Entries:      entries,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				LeaderCommit: rf.commitIndex,
+			}
+			go rf.sendAppendEntriesToPeer(ctx, req, server)
+		}
 	}
 }
 
-func (rf *Raft) tryApply() {
+func (rf *Raft) tryApply(ctx context.Context) {
 	log.Printf("%d try apply", rf.me)
-	rf.mu.Lock()
 	log.Printf("%d grabbed lock in apply", rf.me)
-	for N := rf.commitIndex + 1; N <= len(rf.logs); N++ {
-		count := 1 // 1 for leader
-		log.Printf("%d N: %d, matchIndex: %v", rf.me, N, rf.matchIndex)
-		for idx := range rf.peers {
-			if rf.matchIndex[idx] >= N {
-				count++
+	//write lock
+	for {
+		rf.mu.Lock()
+		for N := rf.commitIndex + 1; N <= len(rf.logs); N++ {
+			count := 1 // 1 for leader
+			log.Printf("%d N: %d, matchIndex: %v", rf.me, N, rf.matchIndex)
+			for idx := range rf.peers {
+				if rf.matchIndex[idx] >= N {
+					count++
+				}
+			}
+			log.Printf("%d N: %d, matchIndex: %v, count %d", rf.me, N, rf.matchIndex, count)
+			if count > len(rf.peers)/2 && rf.logs[N-1].Term == rf.currentTerm {
+				rf.commitIndex = N
+				log.Printf("%d found a suitable N: %d", rf.me, N)
 			}
 		}
-		log.Printf("%d N: %d, matchIndex: %v, count %d", rf.me, N, rf.matchIndex, count)
-		if count > len(rf.peers)/2 && rf.logs[N-1].Term == rf.currentTerm {
-			rf.commitIndex = N
-			log.Printf("%d found a suitable N: %d", rf.me, N)
-			rf.handleCommit(rf.commitIndex)
+		rf.mu.Unlock()
+		rf.tryCommit()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	rf.mu.Unlock()
-	log.Printf("%d finished try apply", rf.me)
 }
 
-func (rf *Raft) handleCommit(commitIndex int) {
+func (rf *Raft) tryCommit() {
 	log.Printf("%d trying to grab lock for commit", rf.me)
-	// rf.mu.Lock()
-	// defer rf.mu.Unlock()
+	rf.mu.Lock()
+	res := make([]ApplyMsg, 0)
+	//write lock
+	commitIndex := rf.commitIndex
 	log.Printf("%d trying to commit: %d, %d", rf.me, rf.lastApplied, rf.commitIndex)
 	log.Printf("%d trying to commit: %v", rf.me, rf.logs)
 	for rf.lastApplied < commitIndex {
@@ -855,8 +894,15 @@ func (rf *Raft) handleCommit(commitIndex int) {
 			CommandIndex: l.Index,
 		}
 		log.Printf("%d trying to commit %v", rf.me, msg)
-		rf.applyCh <- msg
+		res = append(res, msg)
 	}
+
+	rf.mu.Unlock()
+	go func() {
+		for _, val := range res {
+			rf.applyCh <- val
+		}
+	}()
 	log.Printf("%d finished commit", rf.me)
 }
 
@@ -979,16 +1025,17 @@ func (rf *Raft) requestVoteToPeers(ctx context.Context, req *RequestVoteArgs) ch
 	eg, _ := errgroup.WithContext(ctx)
 	for idx := range rf.peers {
 		server := idx
-		if server != rf.me {
-			eg.Go(func() error {
-				if ok := rf.sendRequestVote(ctx, server, req, &replies[server]); !ok {
-					replies[server] = RequestVoteReply{VoteGranted: false}
-					log.Printf("%d failed rpc request for request vote\n", rf.me)
-				}
-				replyCh <- &replies[server]
-				return nil
-			})
+		if server == rf.me {
+			continue
 		}
+		eg.Go(func() error {
+			if ok := rf.sendRequestVote(ctx, server, req, &replies[server]); !ok {
+				replies[server] = RequestVoteReply{VoteGranted: false}
+				log.Printf("%d failed rpc request for request vote\n", rf.me)
+			}
+			replyCh <- &replies[server]
+			return nil
+		})
 	}
 
 	go func() {

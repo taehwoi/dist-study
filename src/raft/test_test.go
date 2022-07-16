@@ -121,13 +121,13 @@ func TestManyElections2A(t *testing.T) {
 		cfg.connect(i3)
 	}
 
-	fmt.Printf("check (1)\n")
-	for server, val := range cfg.rafts {
-		val.mu.Lock()
-		fmt.Printf("status: %v, term: %d, %d's logs: %v\n", val.status, val.currentTerm, server, val.logs)
+	// fmt.Printf("check (1)\n")
+	// for server, val := range cfg.rafts {
+	// 	val.mu.Lock()
+	// 	fmt.Printf("status: %v, term: %d, %d's logs: %v\n", val.status, val.currentTerm, server, val.logs)
 
-		val.mu.Unlock()
-	}
+	// 	val.mu.Unlock()
+	// }
 
 	cfg.checkOneLeader()
 
@@ -309,13 +309,13 @@ func TestFailAgree2B(t *testing.T) {
 	// re-connect
 	cfg.connect((leader + 1) % servers)
 
-	fmt.Printf("check (1)\n")
-	for server, val := range cfg.rafts {
-		val.mu.Lock()
-		fmt.Printf("status: %v, term: %d, %d's logs: %v\n", val.status, val.currentTerm, server, val.logs)
+	// fmt.Printf("check (1)\n")
+	// for server, val := range cfg.rafts {
+	// 	val.mu.Lock()
+	// 	fmt.Printf("status: %v, term: %d, %d's logs: %v\n", val.status, val.currentTerm, server, val.logs)
 
-		val.mu.Unlock()
-	}
+	// 	val.mu.Unlock()
+	// }
 
 	// the full set of servers should preserve
 	// previous agreements, and be able to agree
@@ -342,7 +342,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.disconnect((leader + 2) % servers)
 	cfg.disconnect((leader + 3) % servers)
 
-	fmt.Println("after followers disconnect")
+	// fmt.Println("after followers disconnect")
 
 	index, _, ok := cfg.rafts[leader].Start(20)
 	if ok != true {
@@ -359,12 +359,12 @@ func TestFailNoAgree2B(t *testing.T) {
 		t.Fatalf("%v committed but no majority", n)
 	}
 
-	fmt.Println("start followers repair")
+	// fmt.Println("start followers repair")
 	// repair
 	cfg.connect((leader + 1) % servers)
 	cfg.connect((leader + 2) % servers)
 	cfg.connect((leader + 3) % servers)
-	fmt.Println("followers repaired")
+	// fmt.Println("followers repaired")
 
 	// the disconnected majority may have chosen a leader from
 	// among their own ranks, forgetting index 2.
@@ -376,13 +376,13 @@ func TestFailNoAgree2B(t *testing.T) {
 	if index2 < 2 || index2 > 3 {
 		t.Fatalf("unexpected index %v", index2)
 	}
-	fmt.Println("can agree on 1000?")
-	for server, val := range cfg.rafts {
-		val.mu.Lock()
-		fmt.Printf("%d's logs: %v\n", server, val.logs)
+	// fmt.Println("can agree on 1000?")
+	// for server, val := range cfg.rafts {
+	// 	val.mu.Lock()
+	// 	// fmt.Printf("%d's logs: %v\n", server, val.logs)
 
-		val.mu.Unlock()
-	}
+	// 	val.mu.Unlock()
+	// }
 
 	cfg.one(1000, servers, true)
 
@@ -411,13 +411,13 @@ loop:
 			continue
 		}
 
-		fmt.Printf("check (1)\n")
-		for server, val := range cfg.rafts {
-			val.mu.Lock()
-			fmt.Printf("%d's logs: %v\n", server, val.logs)
+		// fmt.Printf("check (1)\n")
+		// for server, val := range cfg.rafts {
+		// 	val.mu.Lock()
+		// 	fmt.Printf("%d's logs: %v\n", server, val.logs)
 
-			val.mu.Unlock()
-		}
+		// 	val.mu.Unlock()
+		// }
 
 		iters := 5
 		var wg sync.WaitGroup
@@ -440,29 +440,29 @@ loop:
 		wg.Wait()
 		close(is)
 
-		fmt.Printf("check (2)\n")
-		for server, val := range cfg.rafts {
-			val.mu.Lock()
-			fmt.Printf("%d's logs: %v\n", server, val.logs)
+		// fmt.Printf("check (2)\n")
+		// for server, val := range cfg.rafts {
+		// 	val.mu.Lock()
+		// 	fmt.Printf("%d's logs: %v\n", server, val.logs)
 
-			val.mu.Unlock()
-		}
+		// 	val.mu.Unlock()
+		// }
 
 		for j := 0; j < servers; j++ {
-			fmt.Printf("trying to getState of %d\n", j)
+			// fmt.Printf("trying to getState of %d\n", j)
 			if t, _ := cfg.rafts[j].GetState(); t != term {
 				// term changed -- can't expect low RPC counts
 				continue loop
 			}
 		}
 
-		fmt.Printf("check (3)\n")
-		for server, val := range cfg.rafts {
-			val.mu.Lock()
-			fmt.Printf("%d's logs: %v\n", server, val.logs)
+		// fmt.Printf("check (3)\n")
+		// for server, val := range cfg.rafts {
+		// 	val.mu.Lock()
+		// 	fmt.Printf("%d's logs: %v\n", server, val.logs)
 
-			val.mu.Unlock()
-		}
+		// 	val.mu.Unlock()
+		// }
 
 		failed := false
 		cmds := []int{}
@@ -482,13 +482,13 @@ loop:
 			}
 		}
 
-		fmt.Printf("check (4)\n")
-		for server, val := range cfg.rafts {
-			val.mu.Lock()
-			fmt.Printf("%d's logs: %v\n", server, val.logs)
+		// fmt.Printf("check (4)\n")
+		// for server, val := range cfg.rafts {
+		// 	val.mu.Lock()
+		// 	fmt.Printf("%d's logs: %v\n", server, val.logs)
 
-			val.mu.Unlock()
-		}
+		// 	val.mu.Unlock()
+		// }
 
 		if failed {
 			// avoid leaking goroutines
@@ -535,44 +535,44 @@ func TestRejoin2B(t *testing.T) {
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect(leader1)
-	fmt.Println("leader disconnected")
+	// fmt.Println("leader disconnected")
 
 	// make old leader try to agree on some entries
-	fmt.Println("old leader start")
+	// fmt.Println("old leader start")
 	cfg.rafts[leader1].Start(102)
 	cfg.rafts[leader1].Start(103)
 	cfg.rafts[leader1].Start(104)
 
-	fmt.Println("new leader commits")
+	// fmt.Println("new leader commits")
 	// new leader commits, also for index=2
 	cfg.one(103, 2, true)
 
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
 	cfg.disconnect(leader2)
-	fmt.Printf("%d leader disconnected\n", leader2)
+	// fmt.Printf("%d leader disconnected\n", leader2)
 
 	// old leader connected again
 	cfg.connect(leader1)
-	fmt.Printf("%d leader connected again\n", leader1)
+	// fmt.Printf("%d leader connected again\n", leader1)
 
-	fmt.Println("try agreement on 104")
-	fmt.Printf("check (0)\n")
-	for server, val := range cfg.rafts {
-		val.mu.Lock()
-		fmt.Printf("%v: %d's logs: %v, term: %d\n", val.status, server, val.logs, val.currentTerm)
+	// fmt.Println("try agreement on 104")
+	// fmt.Printf("check (0)\n")
+	// for server, val := range cfg.rafts {
+	// 	val.mu.Lock()
+	// 	fmt.Printf("%v: %d's logs: %v, term: %d\n", val.status, server, val.logs, val.currentTerm)
 
-		val.mu.Unlock()
-	}
+	// 	val.mu.Unlock()
+	// }
 	cfg.one(104, 2, true)
-	fmt.Printf("check (0)\n")
-	for server, val := range cfg.rafts {
-		val.mu.Lock()
-		fmt.Printf("%v: %d's logs: %v\n", val.status, server, val.logs)
+	// fmt.Printf("check (0)\n")
+	// for server, val := range cfg.rafts {
+	// 	val.mu.Lock()
+	// 	fmt.Printf("%v: %d's logs: %v\n", val.status, server, val.logs)
 
-		val.mu.Unlock()
-	}
-	fmt.Println("agreement on 104 done")
+	// 	val.mu.Unlock()
+	// }
+	// fmt.Println("agreement on 104 done")
 
 	// all together now
 	cfg.connect(leader2)
@@ -653,7 +653,7 @@ func TestBackup2B(t *testing.T) {
 
 	time.Sleep(RaftElectionTimeout / 2)
 
-	fmt.Println("bring original leader back to life")
+	// fmt.Println("bring original leader back to life")
 	// bring original leader back to life,
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
@@ -662,7 +662,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
 
-	fmt.Println("lots of successful commands to new group")
+	// fmt.Println("lots of successful commands to new group")
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
