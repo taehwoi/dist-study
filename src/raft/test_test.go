@@ -20,7 +20,7 @@ import (
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
 // TODO: decrease this
-const RaftElectionTimeout = 1000 * time.Millisecond
+const RaftElectionTimeout = 500 * time.Millisecond
 
 func TestInitialElection2A(t *testing.T) {
 	servers := 3

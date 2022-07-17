@@ -824,61 +824,65 @@ func (rf *Raft) sendAppendEntriesToPeer(ctx context.Context, req *AppendEntriesA
 		// WHAT TO DO with term??
 		// find Max(firstIndexWithConflictingTerm, reply's firstConflictingIndex)
 		// rf.nex
-		rf.nextIndex[server] = Max(reply.FirstConflictingIndex, 1)
+		// rf.nextIndex[server] = Max(reply.FirstConflictingIndex, 1)
 		// var x int
-		// for _, val := range rf.logs {
-		// 	if val.Term == reply.ConflictingTerm {
-		// 		x = val.Index
-		// 	}
-		// }
-		// rf.nextIndex[server] = Max(Max(x, reply.FirstConflictingIndex), 1)
+		x := 1
+		for _, val := range rf.logs {
+			if val.Term == reply.ConflictingTerm {
+				x = val.Index
+			}
+		}
+		rf.nextIndex[server] = Max(x, reply.FirstConflictingIndex)
 		// Max might be unecessary
 		// rf.nextIndex[server] = rf.nextIndex[server] - 1
 		// TODO: we need optimization to solve Test (2C): Figure 8 (unreliable) ...
 		// rf.nextIndex[server] = Max(rf.nextIndex[server]-1, 1)
 
 		//retry
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			entries := make([]*Log, 0)
+		entries := make([]*Log, 0)
 
-			next := rf.nextIndex[server]
-			entries = append(entries, rf.logs[next-1:]...)
+		next := rf.nextIndex[server]
+		entries = append(entries, rf.logs[next-1:]...)
 
-			var prevLogIndex int
-			var prevLogTerm int
+		var prevLogIndex int
+		var prevLogTerm int
 
-			if next == 1 {
-				prevLogIndex = 0
-				prevLogTerm = -1
-			} else {
-				prevLogIndex = rf.logs[next-2].Index
-				prevLogTerm = rf.logs[next-2].Term
-			}
-			req := &AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				Entries:      entries,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				LeaderCommit: rf.commitIndex,
-			}
-			go rf.sendAppendEntriesToPeer(ctx, req, server)
+		if next == 1 {
+			prevLogIndex = 0
+			prevLogTerm = -1
+		} else {
+			prevLogIndex = rf.logs[next-2].Index
+			prevLogTerm = rf.logs[next-2].Term
 		}
+		req := &AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			Entries:      entries,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			LeaderCommit: rf.commitIndex,
+		}
+		go rf.sendAppendEntriesToPeer(ctx, req, server)
 	}
 }
 
+// even without Start, we have to try and sync other followers with leader's logs
 func (rf *Raft) periodicAgreement(ctx context.Context) {
 
 	for {
+
+		eg, _ := errgroup.WithContext(ctx)
 		for idx := range rf.peers {
-			if idx == rf.me {
+			server := idx
+			if server == rf.me {
 				continue
 			}
-			rf.beginEntriesAgreement(ctx, idx)
+			eg.Go(func() error {
+				rf.beginEntriesAgreement(ctx, server)
+				return nil
+			})
 		}
+		eg.Wait()
 		select {
 		case <-ctx.Done():
 			return
@@ -953,7 +957,7 @@ func (rf *Raft) tryApplyToClient(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
 }
@@ -1016,7 +1020,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) startElection(ctx context.Context) {
-	// TODO: cancel election if receiving heartbeat
 	log.Printf("%d: starting election\n", rf.me)
 	rf.mu.Lock()
 	// increment current term
