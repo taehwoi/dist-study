@@ -25,7 +25,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"math"
 	"math/rand"
 	"sync"
 	"time"
@@ -196,9 +195,11 @@ func (rf *Raft) handleEvent(ctx context.Context, e event, data int) status {
 	case FOLLOWER:
 		if e == ELECTION_TIMEOUTED {
 			log.Printf("%d: FOLLOWER => CANDIDATE\n", rf.me)
+			rf.mu.Lock()
 			rf.status = CANDIDATE
 			rf.candidateContext, rf.candidateCancleFunc = context.WithCancel(ctx)
 			go rf.startElection(rf.candidateContext)
+			rf.mu.Unlock()
 		} else if e == HIGHER_TERM_FOUND {
 			log.Printf("%d: FOLLOWER => FOLLOWER\n", rf.me)
 			rf.handleHigherTermFound(data)
@@ -457,9 +458,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = rf.currentTerm
 			rf.votedFor = args.CandidateId
 			rf.persist()
-			go func() {
-				rf.voteRequestCh <- struct{}{}
-			}()
+			rf.voteRequestCh <- struct{}{}
 		} else {
 			log.Printf("%d did not vote for %d\n", rf.me, args.CandidateId)
 			reply.VoteGranted = false
@@ -521,10 +520,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term >= rf.currentTerm {
 		log.Printf("%d received valid heartbeat\n", rf.me)
 		// received heartbeat
+		// go func() {
+		rf.heartbeatCh <- struct{}{}
+		// }()
 		rf.handleEvent(rf.mainContext, CURRENT_LEADER_FOUND, 0)
-		go func() {
-			rf.heartbeatCh <- struct{}{}
-		}()
 	}
 
 	if args.Term > rf.currentTerm {
@@ -736,13 +735,12 @@ func (rf *Raft) ticker(ctx context.Context) {
 		r := ElectionTimeOutMin + rand.Intn(ElectionTimeOutMax-ElectionTimeOutMin+1)
 		t := time.Duration(r) * time.Millisecond
 		// r can be infinite if leader
-		rf.mu.Lock()
-		if rf.status == LEADER {
-			// 300 years
-			t = time.Duration(math.MaxInt64)
-			log.Printf("setting a large timer %d", t)
-		}
-		rf.mu.Unlock()
+		// rf.mu.Lock()
+		// 300 years
+		// t = time.Duration(math.MaxInt64)
+		// log.Printf("setting a large timer %d", t)
+		// }
+		// rf.mu.Unlock()
 
 		select {
 		case <-rf.heartbeatCh:
@@ -751,9 +749,9 @@ func (rf *Raft) ticker(ctx context.Context) {
 			// log.Printf("%d received voterequest before election timeout\n", rf.me)
 		case <-time.After(t):
 			// TODO: cancel election if receiving heartbeat
-			rf.mu.Lock()
-			rf.handleEvent(ctx, ELECTION_TIMEOUTED, 0)
-			rf.mu.Unlock()
+			// rf.mu.Lock()
+			go rf.handleEvent(ctx, ELECTION_TIMEOUTED, 0)
+			// rf.mu.Unlock()
 		case <-ctx.Done():
 			return
 		}
@@ -819,7 +817,6 @@ func (rf *Raft) sendAppendEntriesToPeer(ctx context.Context, req *AppendEntriesA
 	if ok := rf.sendAppendEntries(ctx, server, req, &reply); !ok {
 		// log.Printf("%d failed rpc request %v to server %d for append entry", rf.me, req, server)
 		return
-		//retry
 	}
 
 	rf.mu.Lock()
@@ -967,8 +964,8 @@ func (rf *Raft) tryUpdateCommitIndex(ctx context.Context) {
 func (rf *Raft) tryApplyToClient(ctx context.Context) {
 	log.Printf("%d trying to grab lock for apply", rf.me)
 	for {
-		rf.mu.Lock()
 		res := make([]ApplyMsg, 0)
+		rf.mu.Lock()
 		//write lock
 		commitIndex := rf.commitIndex
 		log.Printf("%d trying to apply: %d, %d", rf.me, rf.lastApplied, rf.commitIndex)
@@ -984,11 +981,10 @@ func (rf *Raft) tryApplyToClient(ctx context.Context) {
 			log.Printf("%d trying to apply %v", rf.me, msg)
 			res = append(res, msg)
 		}
+		rf.mu.Unlock()
 		if len(res) > 0 {
 			log.Printf("%d applying: %v", rf.me, res)
 		}
-
-		rf.mu.Unlock()
 		for _, val := range res {
 			rf.applyCh <- val
 		}
@@ -997,7 +993,7 @@ func (rf *Raft) tryApplyToClient(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(10 * time.Millisecond):
+		case <-time.After(50 * time.Millisecond):
 		}
 	}
 }
