@@ -187,6 +187,7 @@ func (rf *Raft) handleEvent(ctx context.Context, e event, data int) status {
 			log.Printf("%d: UNDEFINED => STARTED\n", rf.me)
 			// start ticker goroutine to start elections
 			go rf.ticker(ctx)
+			go rf.tryApplyToClient(ctx)
 		}
 	case FOLLOWER:
 		if e == ELECTION_TIMEOUTED {
@@ -215,7 +216,7 @@ func (rf *Raft) handleEvent(ctx context.Context, e event, data int) status {
 
 			// send heart beat as new leader
 			go rf.sendHeartBeat(rf.leaderContext)
-			go rf.tryApply(rf.leaderContext)
+			go rf.tryUpdateCommitIndex(rf.leaderContext)
 			go rf.periodicAgreement(rf.leaderContext)
 
 			// start begin entries for once
@@ -236,7 +237,7 @@ func (rf *Raft) handleEvent(ctx context.Context, e event, data int) status {
 			rf.handleHigherTermFound(data)
 		} else if e == ELECTION_TIMEOUTED {
 			log.Printf("%d: CANDIDATE => CANDIDATE\n", rf.me)
-			go rf.startElection(ctx)
+			go rf.startElection(rf.candidateContext)
 		}
 	case LEADER:
 		if e == HIGHER_TERM_FOUND {
@@ -316,8 +317,8 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = buf.CurrentTerm
 		rf.votedFor = buf.VotedFor
 		rf.logs = buf.Logs
-		log.Printf("read persist..!")
-		log.Printf("%v", buf)
+		// log.Printf("read persist..!")
+		// log.Printf("%v", buf)
 	}
 }
 
@@ -418,37 +419,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		log.Printf("%d can vote for %d, check logs %v", rf.me, args.CandidateId, rf.logs)
+		// log.Printf("%d can vote for %d, check logs %v", rf.me, args.CandidateId, rf.logs)
 		log.Printf("%d can vote for, args: %v", rf.me, args)
 		lastLogIndex := len(rf.logs)
 
-		if lastLogIndex == 0 && args.LastLogIndex == 0 && args.LastLogTerm == -1 {
-			reply.VoteGranted = true
-			reply.Term = rf.currentTerm
-			rf.votedFor = args.CandidateId
-			go func() {
-				rf.voteRequestCh <- struct{}{}
-			}()
-			return
+		lastLogTerm := -1
+		if lastLogIndex >= 1 {
+			lastLogTerm = rf.logs[lastLogIndex-1].Term
 		}
 
-		// var lastLogTerm int
-		// if lastLogIndex >= 1 {
-		// 	lastLogTerm = rf.logs[lastLogIndex-1].Term
-		// } else {
-		// 	lastLogTerm = -1
-		// }
-
-		if args.LastLogTerm > rf.logs[lastLogIndex-1].Term {
-			log.Printf("%d voted for %d\n", rf.me, args.CandidateId)
-			reply.VoteGranted = true
-			reply.Term = rf.currentTerm
-			rf.votedFor = args.CandidateId
-			rf.persist()
-			go func() {
-				rf.voteRequestCh <- struct{}{}
-			}()
-		} else if args.LastLogTerm == rf.logs[lastLogIndex-1].Term && args.LastLogIndex >= lastLogIndex {
+		if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 			log.Printf("%d voted for %d\n", rf.me, args.CandidateId)
 			reply.VoteGranted = true
 			reply.Term = rf.currentTerm
@@ -529,7 +509,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	log.Printf("%d, args: %v", rf.me, args)
-	log.Printf("%d's current logs: %v, pli: %d", rf.me, rf.logs, args.PrevLogIndex)
+	// log.Printf("%d's current logs: %v, pli: %d", rf.me, rf.logs, args.PrevLogIndex)
 
 	reply.Term = rf.currentTerm
 
@@ -591,12 +571,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.LeaderCommit > rf.commitIndex {
 		log.Printf("%d leader commit updated %d, %d, %d", rf.me, args.LeaderCommit, rf.commitIndex, rf.lastNewEntryIndex)
-		prev := rf.commitIndex
+		// prev := rf.commitIndex
 		rf.commitIndex = Min(args.LeaderCommit, rf.lastNewEntryIndex)
 		log.Printf("%d new commit index %d", rf.me, rf.commitIndex)
-		if prev != rf.commitIndex {
-			go rf.tryCommit()
-		}
+		// if prev != rf.commitIndex {
+		// go rf.tryCommit()
+		// }
 	}
 
 }
@@ -842,10 +822,20 @@ func (rf *Raft) sendAppendEntriesToPeer(ctx context.Context, req *AppendEntriesA
 	} else {
 		// if rf.logs[reply.FirstConflictingIndex-1]
 		// WHAT TO DO with term??
-		// rf.nextIndex[server] = Max(reply.FirstConflictingIndex, 1)
+		// find Max(firstIndexWithConflictingTerm, reply's firstConflictingIndex)
+		// rf.nex
+		rf.nextIndex[server] = Max(reply.FirstConflictingIndex, 1)
+		// var x int
+		// for _, val := range rf.logs {
+		// 	if val.Term == reply.ConflictingTerm {
+		// 		x = val.Index
+		// 	}
+		// }
+		// rf.nextIndex[server] = Max(Max(x, reply.FirstConflictingIndex), 1)
 		// Max might be unecessary
 		// rf.nextIndex[server] = rf.nextIndex[server] - 1
-		rf.nextIndex[server]--
+		// TODO: we need optimization to solve Test (2C): Figure 8 (unreliable) ...
+		// rf.nextIndex[server] = Max(rf.nextIndex[server]-1, 1)
 
 		//retry
 		select {
@@ -898,9 +888,9 @@ func (rf *Raft) periodicAgreement(ctx context.Context) {
 
 }
 
-func (rf *Raft) tryApply(ctx context.Context) {
-	log.Printf("%d try apply", rf.me)
-	log.Printf("%d grabbed lock in apply", rf.me)
+func (rf *Raft) tryUpdateCommitIndex(ctx context.Context) {
+	log.Printf("%d try updateCommitIndex", rf.me)
+	log.Printf("%d grabbed lock in updateCommitIndex", rf.me)
 	//write lock
 	for {
 		rf.mu.Lock()
@@ -908,7 +898,7 @@ func (rf *Raft) tryApply(ctx context.Context) {
 			count := 1 // 1 for leader
 			log.Printf("%d N: %d, matchIndex: %v", rf.me, N, rf.matchIndex)
 			for idx := range rf.peers {
-				if rf.matchIndex[idx] >= N {
+				if idx != rf.me && rf.matchIndex[idx] >= N {
 					count++
 				}
 			}
@@ -919,7 +909,9 @@ func (rf *Raft) tryApply(ctx context.Context) {
 			}
 		}
 		rf.mu.Unlock()
-		rf.tryCommit()
+		//tryCommit should be ran in its own designated goroutine; not called by others
+		// if tryCommit is called by other function as goroutines; the order of commit is not fixed
+		// rf.tryCommit()
 		select {
 		case <-ctx.Done():
 			return
@@ -928,34 +920,42 @@ func (rf *Raft) tryApply(ctx context.Context) {
 	}
 }
 
-func (rf *Raft) tryCommit() {
-	log.Printf("%d trying to grab lock for commit", rf.me)
-	rf.mu.Lock()
-	res := make([]ApplyMsg, 0)
-	//write lock
-	commitIndex := rf.commitIndex
-	log.Printf("%d trying to commit: %d, %d", rf.me, rf.lastApplied, rf.commitIndex)
-	// log.Printf("%d trying to commit: %v", rf.me, rf.logs[rf.lastApplied-1:rf.commitIndex-1])
-	for rf.lastApplied < commitIndex {
-		rf.lastApplied++
-		l := rf.logs[rf.lastApplied-1]
-		msg := ApplyMsg{
-			CommandValid: true,
-			Command:      l.Command,
-			CommandIndex: l.Index,
+func (rf *Raft) tryApplyToClient(ctx context.Context) {
+	log.Printf("%d trying to grab lock for apply", rf.me)
+	for {
+		rf.mu.Lock()
+		res := make([]ApplyMsg, 0)
+		//write lock
+		commitIndex := rf.commitIndex
+		log.Printf("%d trying to apply: %d, %d", rf.me, rf.lastApplied, rf.commitIndex)
+		// log.Printf("%d trying to commit: %v", rf.me, rf.logs[rf.lastApplied-1:rf.commitIndex-1])
+		for rf.lastApplied < commitIndex {
+			rf.lastApplied++
+			l := rf.logs[rf.lastApplied-1]
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      l.Command,
+				CommandIndex: l.Index,
+			}
+			log.Printf("%d trying to apply %v", rf.me, msg)
+			res = append(res, msg)
 		}
-		log.Printf("%d trying to commit %v", rf.me, msg)
-		res = append(res, msg)
-	}
-	if len(res) > 0 {
-		log.Printf("%d committing: %v", rf.me, res)
-	}
+		if len(res) > 0 {
+			log.Printf("%d applying: %v", rf.me, res)
+		}
 
-	rf.mu.Unlock()
-	for _, val := range res {
-		rf.applyCh <- val
+		rf.mu.Unlock()
+		for _, val := range res {
+			rf.applyCh <- val
+		}
+		log.Printf("%d finished apply", rf.me)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
-	log.Printf("%d finished commit", rf.me)
 }
 
 func (rf *Raft) sendAppendEntries(ctx context.Context,
@@ -1029,7 +1029,7 @@ func (rf *Raft) startElection(ctx context.Context) {
 	var lastLogTerm int
 
 	if lastLogIndex == 0 {
-		lastLogTerm = -1 // a substitue for a long value
+		lastLogTerm = -1 // a substitue for a null value
 	} else {
 		lastLogTerm = rf.logs[lastLogIndex-1].Term
 	}
