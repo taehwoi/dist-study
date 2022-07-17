@@ -1304,20 +1304,20 @@ func TestSnapshotBasic2D(t *testing.T) {
 	snapcommon(t, "Test (2D): snapshots basic", false, true, false)
 }
 
-func TestSnapshotInstall2D(t *testing.T) {
+func TestSnapshotInstall2E(t *testing.T) {
 	snapcommon(t, "Test (2D): install snapshots (disconnect)", true, true, false)
 }
 
-func TestSnapshotInstallUnreliable2D(t *testing.T) {
+func TestSnapshotInstallUnreliable2E(t *testing.T) {
 	snapcommon(t, "Test (2D): install snapshots (disconnect+unreliable)",
 		true, false, false)
 }
 
-func TestSnapshotInstallCrash2D(t *testing.T) {
+func TestSnapshotInstallCrash2E(t *testing.T) {
 	snapcommon(t, "Test (2D): install snapshots (crash)", false, true, true)
 }
 
-func TestSnapshotInstallUnCrash2D(t *testing.T) {
+func TestSnapshotInstallUnCrash2E(t *testing.T) {
 	snapcommon(t, "Test (2D): install snapshots (unreliable+crash)", false, false, true)
 }
 
@@ -1326,7 +1326,7 @@ func TestSnapshotInstallUnCrash2D(t *testing.T) {
 // restart using snapshot along with the
 // tail of the log?
 //
-func TestSnapshotAllCrash2D(t *testing.T) {
+func TestSnapshotAllCrash2E(t *testing.T) {
 	servers := 3
 	iters := 5
 	cfg := make_config(t, servers, false, true)
