@@ -10,6 +10,7 @@ package raft
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -20,7 +21,7 @@ import (
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
 // TODO: decrease this
-const RaftElectionTimeout = 500 * time.Millisecond
+const RaftElectionTimeout = 1000 * time.Millisecond
 
 func TestInitialElection2A(t *testing.T) {
 	servers := 3
@@ -60,12 +61,16 @@ func TestReElection2A(t *testing.T) {
 
 	cfg.begin("Test (2A): election after network failure")
 
+	fmt.Println("check One leader")
 	leader1 := cfg.checkOneLeader()
+	fmt.Println("check One leader done")
 
 	// if the leader disconnects, a new one should be elected.
 	cfg.disconnect(leader1)
+	fmt.Println("disconnected")
 	cfg.checkOneLeader()
 
+	fmt.Println("check one leader success")
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader. and the old leader
 	// should switch to follower.
@@ -74,10 +79,12 @@ func TestReElection2A(t *testing.T) {
 
 	// if there's no quorum, no new leader should
 	// be elected.
+	fmt.Println("no quorum, no leader")
 	cfg.disconnect(leader2)
 	cfg.disconnect((leader2 + 1) % servers)
 	time.Sleep(2 * RaftElectionTimeout)
 
+	fmt.Println("check no leader")
 	// check that the one connected server
 	// does not think it is the leader.
 	cfg.checkNoLeader()
@@ -148,6 +155,8 @@ func TestBasicAgree2B(t *testing.T) {
 			t.Fatalf("some have committed before Start()")
 		}
 
+		log.Printf("start commiting")
+
 		xindex := cfg.one(index*100, servers, false)
 		if xindex != index {
 			t.Fatalf("got index %v but expected %v", xindex, index)
@@ -203,13 +212,16 @@ func TestFollowerFailure2B(t *testing.T) {
 	cfg.begin("Test (2B): test progressive failure of followers")
 
 	cfg.one(101, servers, false)
+	fmt.Println("agree on one")
 
 	// disconnect one follower from the network.
+	fmt.Println("check on leader")
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect((leader1 + 1) % servers)
 
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
+	fmt.Println("even with one less follower, can agree")
 	cfg.one(102, servers-1, false)
 	time.Sleep(RaftElectionTimeout)
 	cfg.one(103, servers-1, false)
@@ -1304,20 +1316,20 @@ func TestSnapshotBasic2D(t *testing.T) {
 	snapcommon(t, "Test (2D): snapshots basic", false, true, false)
 }
 
-func TestSnapshotInstall2E(t *testing.T) {
+func TestSnapshotInstall2D(t *testing.T) {
 	snapcommon(t, "Test (2D): install snapshots (disconnect)", true, true, false)
 }
 
-func TestSnapshotInstallUnreliable2E(t *testing.T) {
+func TestSnapshotInstallUnreliable2D(t *testing.T) {
 	snapcommon(t, "Test (2D): install snapshots (disconnect+unreliable)",
 		true, false, false)
 }
 
-func TestSnapshotInstallCrash2E(t *testing.T) {
+func TestSnapshotInstallCrash2D(t *testing.T) {
 	snapcommon(t, "Test (2D): install snapshots (crash)", false, true, true)
 }
 
-func TestSnapshotInstallUnCrash2E(t *testing.T) {
+func TestSnapshotInstallUnCrash2D(t *testing.T) {
 	snapcommon(t, "Test (2D): install snapshots (unreliable+crash)", false, false, true)
 }
 
@@ -1326,7 +1338,7 @@ func TestSnapshotInstallUnCrash2E(t *testing.T) {
 // restart using snapshot along with the
 // tail of the log?
 //
-func TestSnapshotAllCrash2E(t *testing.T) {
+func TestSnapshotAllCrash2D(t *testing.T) {
 	servers := 3
 	iters := 5
 	cfg := make_config(t, servers, false, true)
