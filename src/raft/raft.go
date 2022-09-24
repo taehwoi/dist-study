@@ -124,7 +124,7 @@ type AppendEntriesRPC struct {
 	replyCh chan *AppendEntriesReply
 }
 
-// holds append entries reply with meta info
+// holds append entries reply with meta
 type AppendEntriesTuple struct {
 	reply *AppendEntriesReply
 
@@ -592,8 +592,9 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	reply.Term = rf.getTerm()
 	reply.Success = false
 
+	//???
 	if args.Term == rf.getTerm() {
-		log.Printf("%d received valid heartbeat\n", rf.me)
+		log.Printf("%d received valid heartbeat from %d\n", rf.me, args.LeaderId)
 		// rf.handleHigherTermFound(args.Term)
 		// received heartbeat
 		// go func() {
@@ -829,6 +830,7 @@ func (rf *Raft) sendEmptyAppendEntriesToPeers(ctx context.Context) <-chan *Appen
 	// we actually need rf.peers - 1, but this makes indexing easier
 	replies := make([]AppendEntriesReply, len(rf.peers))
 	// replyCh := make(chan *AppendEntriesReply, len(rf.peers)-1)
+	term := rf.getTerm()
 
 	eg, _ := errgroup.WithContext(ctx)
 	for idx := range rf.peers {
@@ -850,7 +852,7 @@ func (rf *Raft) sendEmptyAppendEntriesToPeers(ctx context.Context) <-chan *Appen
 			prevLogTerm = rf.logs[next-rf.snapshotIndex-2].Term
 		}
 		req := &AppendEntriesArgs{
-			Term:         rf.getTerm(),
+			Term:         term,
 			LeaderId:     rf.me,
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
@@ -896,14 +898,11 @@ func (rf *Raft) updateCommitIndex(ctx context.Context) {
 	}
 }
 
+// called only in the main thread
 func (rf *Raft) applyToClient(ctx context.Context) {
-	log.Printf("%d trying to grab lock for apply", rf.me)
 	res := make([]ApplyMsg, 0)
-	//write lock
 	commitIndex := rf.commitIndex
-	log.Printf("%d trying to apply: %d, %d", rf.me, rf.lastApplied, rf.commitIndex)
-	// log.Printf("%d trying to commit: %v", rf.me, rf.logs[rf.lastApplied-1:rf.commitIndex-1])
-	for rf.lastApplied < commitIndex {
+	for commitIndex > rf.lastApplied {
 		rf.lastApplied++
 		l := rf.logs[rf.lastApplied-1-rf.snapshotIndex]
 		msg := ApplyMsg{
@@ -911,15 +910,15 @@ func (rf *Raft) applyToClient(ctx context.Context) {
 			Command:      l.Command,
 			CommandIndex: l.Index,
 		}
-		log.Printf("%d trying to apply %v", rf.me, msg)
 		res = append(res, msg)
 	}
 	for _, val := range res {
-		log.Printf("%d applying %v", rf.me, val)
 		rf.applyCh <- val
 	}
-	log.Printf("%d finished apply", rf.me)
-
+	if len(res) > 0 {
+		log.Printf("----------------------------------------------")
+		log.Printf("%d applied %v", rf.me, res)
+	}
 }
 
 func (rf *Raft) sendAppendEntries(ctx context.Context,
@@ -999,6 +998,8 @@ func (rf *Raft) runAsFollower(ctx context.Context) {
 	t := time.Duration(r) * time.Millisecond
 	timeoutCh := time.After(t)
 
+	// applyTimeOutCh := time.After(10 * time.Millisecond)
+
 	for rf.getStatus() == FOLLOWER {
 		select {
 		case req := <-rf.requestVoteCh:
@@ -1034,6 +1035,11 @@ func (rf *Raft) runAsFollower(ctx context.Context) {
 				isLeader,
 			}
 
+		// case <-applyTimeOutCh:
+		// rf.applyToClient(ctx)
+
+		// applyTimeOutCh = time.After(10 * time.Millisecond)
+
 		// electionTimeOut expired
 		case <-timeoutCh:
 			rf.setStatus(CANDIDATE)
@@ -1058,6 +1064,7 @@ func (rf *Raft) runAsCandidate(ctx context.Context) {
 	votesNeeded := len(rf.peers) / 2
 
 	voteCh := rf.startElection(rf.mainContext)
+	// applyTimeOutCh := time.After(10 * time.Millisecond)
 
 	for rf.getStatus() == CANDIDATE {
 		select {
@@ -1118,6 +1125,11 @@ func (rf *Raft) runAsCandidate(ctx context.Context) {
 			t = time.Duration(r) * time.Millisecond
 			timeoutCh = time.After(t)
 
+		// case <-applyTimeOutCh:
+		// rf.applyToClient(ctx)
+
+		// applyTimeOutCh = time.After(10 * time.Millisecond)
+
 		case <-timeoutCh:
 			// return as candidate, which will restart the voting process
 			return
@@ -1145,7 +1157,8 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 	rf.matchIndex = make([]int, len(rf.peers))
 
 	// send heart beat as new leader, once
-	rf.sendHeartBeat(ctx)
+	leaderContext, leaderCancel := context.WithCancel(ctx)
+	rf.sendHeartBeat(leaderContext)
 
 	heartbeatTimeOutCh := time.After(150 * time.Millisecond)
 	//TODO: temp fix: instead of trying it every loop, do it after responses from followers
@@ -1174,10 +1187,9 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 				isLeader,
 			}
 
-			rf.broadcastAppendEntries(rf.mainContext)
+			rf.broadcastAppendEntries(leaderContext)
 
 		case replyTup := <-rf.appendEntriesReplyCh:
-			log.Printf("----------------------------------------------")
 			log.Printf("recieving reply from appned entries")
 			reply := replyTup.reply
 			req := replyTup.args
@@ -1192,12 +1204,15 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 			}
 			if reply.Term > rf.getTerm() {
 				rf.handleHigherTermFound(reply.Term)
+				continue
 			}
 			if reply.Success {
 				// update nextIndex and matchIndex for follower
 				log.Printf("updating nextIndex and matchIndex for follower")
+				log.Printf("before: %v, %v", rf.nextIndex, rf.matchIndex)
 				rf.matchIndex[server] = req.PrevLogIndex + len(req.Entries)
 				rf.nextIndex[server] = rf.matchIndex[server] + 1
+				log.Printf("after: %v, %v", rf.nextIndex, rf.matchIndex)
 			} else { //retry, after decrementing nextIndex
 
 				// decrement nextIndex
@@ -1208,18 +1223,18 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 					}
 				}
 				rf.nextIndex[server] = Max(x, reply.FirstConflictingIndex)
-				rf.singleAppendEntries(ctx, server)
+				rf.singleAppendEntries(leaderContext, server)
 			}
 
 		case <-heartbeatTimeOutCh:
-			rf.sendHeartBeat(ctx)
+			rf.sendHeartBeat(leaderContext)
 			// refresh timer
 			heartbeatTimeOutCh = time.After(150 * time.Millisecond)
 
 		// FIXME: remove?
 		case <-tryUpdateCommitTimeOutCh:
-			rf.updateCommitIndex(ctx)
-			rf.applyToClient(ctx)
+			rf.updateCommitIndex(leaderContext)
+			rf.applyToClient(leaderContext)
 
 			tryUpdateCommitTimeOutCh = time.After(100 * time.Millisecond)
 
@@ -1229,11 +1244,11 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 			req.replyCh <- reply
 
 		case <-ctx.Done():
+			leaderCancel()
 			return
 		}
-
 	}
-
+	leaderCancel()
 }
 
 //
