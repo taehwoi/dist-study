@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
@@ -692,6 +693,8 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 //
 //TODO: make this to a channel, with command
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	log.Println("begin start")
+	defer log.Println("done start")
 
 	replyCh := make(chan *struct {
 		index    int
@@ -1230,6 +1233,7 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 				rf.nextIndex[server] = rf.matchIndex[server] + 1
 				log.Printf("%d after: %v, %v", rf.nextIndex, rf.matchIndex, rf.me)
 
+				rf.updateCommitIndex()
 				//TODO: if somethign does not work;
 				// peridiocally do this: If last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
 			} else { //retry, after decrementing nextIndex
@@ -1255,7 +1259,7 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 
 		// FIXME: remove?
 		case <-tryApplyTimeoutCh:
-			rf.updateCommitIndex()
+			// rf.updateCommitIndex()
 			rf.applyToClient()
 
 			tryApplyTimeoutCh = time.After(50 * time.Millisecond)
@@ -1380,6 +1384,6 @@ func (rf *Raft) requestVoteToPeers(ctx context.Context, req *RequestVoteArgs) <-
 }
 
 func init() {
-	// log.SetOutput(ioutil.Discard)
-	// log.SetFlags(0)
+	log.SetOutput(ioutil.Discard)
+	log.SetFlags(0)
 }
