@@ -23,7 +23,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
@@ -110,6 +109,11 @@ type StartRPC struct {
 	}
 }
 
+type SnapshotRequest struct {
+	index    int
+	snapshot []byte
+}
+
 type RequestVoteRPC struct {
 	args    *RequestVoteArgs
 	replyCh chan *RequestVoteReply
@@ -175,6 +179,9 @@ type Raft struct {
 	appendEntriesReplyCh chan *AppendEntriesTuple
 
 	requestVoteCh chan *RequestVoteRPC
+
+	// notifies that a snapshot request has arrived
+	snapshotRequestCh chan *SnapshotRequest
 
 	InstallSnapshotCh chan *struct {
 		*InstallSnapshotRequest
@@ -269,8 +276,6 @@ func (rf *Raft) readPersist(data []byte) {
 //
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
-	// Your code here (2D).
-
 	return true
 }
 
@@ -279,9 +284,25 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	log.Printf("%d snapshot request arrived", rf.me)
+	req := &SnapshotRequest{
+		index:    index,
+		snapshot: snapshot,
+	}
+
+	go func() { rf.snapshotRequestCh <- req }()
+}
+
+// should only be called in the main thread
+func (rf *Raft) handleSnapshot(req *SnapshotRequest) {
+	log.Printf("%d handling snapshot request", rf.me)
+	log.Printf("%d's logs %v", rf.me, rf.logs)
+	log.Printf("%d's snapshot %v", rf.me, rf.snapshot)
+	log.Printf("%d's snapshotIndex %d", rf.me, rf.snapshotIndex)
+	log.Printf("%d's snapshotTerm %d", rf.me, rf.snapshotTerm)
 	// Your code here (2D).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	snapshot := req.snapshot
+	index := req.index
 
 	rf.snapshot = snapshot
 
@@ -293,6 +314,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	rf.snapshotIndex = index
 
+	log.Printf("%d's logs after snap %v", rf.me, rf.logs)
+	log.Printf("%d's snapshot after snap %v", rf.me, rf.snapshot)
+	log.Printf("%d's snapshotIndex after snap %d", rf.me, rf.snapshotIndex)
+	log.Printf("%d's snapshotTerm after snap %d", rf.me, rf.snapshotTerm)
 }
 
 //
@@ -759,6 +784,7 @@ func (rf *Raft) singleAppendEntries(ctx context.Context, server int) <-chan *App
 		var prevLogIndex int
 		var prevLogTerm int
 
+		// FIXME?
 		if next-rf.snapshotIndex <= 1 {
 			prevLogIndex = rf.snapshotIndex
 			prevLogTerm = rf.snapshotTerm
@@ -850,9 +876,9 @@ func (rf *Raft) sendEmptyAppendEntriesToPeers(ctx context.Context) <-chan *Appen
 		var prevLogIndex int
 		var prevLogTerm int
 
-		if len(rf.logs)-rf.snapshotIndex == 0 {
-			prevLogIndex = 0
-			prevLogTerm = -1
+		if len(rf.logs)-rf.snapshotIndex <= 0 {
+			prevLogIndex = rf.snapshotIndex
+			prevLogTerm = rf.snapshotTerm
 		} else {
 			prevLogIndex = rf.logs[len(rf.logs)-1].Index
 			prevLogTerm = rf.logs[len(rf.logs)-1].Term
@@ -1035,6 +1061,9 @@ func (rf *Raft) runAsFollower(ctx context.Context) {
 			t = time.Duration(r) * time.Millisecond
 			timeoutCh = time.After(t)
 
+		case req := <-rf.snapshotRequestCh:
+			rf.handleSnapshot(req)
+
 		case req := <-rf.commandCh:
 			index, term, isLeader := rf.handleCommand(req.command)
 
@@ -1118,6 +1147,9 @@ func (rf *Raft) runAsCandidate(ctx context.Context) {
 				rf.setStatus(LEADER)
 				return
 			}
+
+		case req := <-rf.snapshotRequestCh:
+			rf.handleSnapshot(req)
 
 		case req := <-rf.commandCh:
 			index, term, isLeader := rf.handleCommand(req.command)
@@ -1227,11 +1259,12 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 			}
 			if reply.Success {
 				// update nextIndex and matchIndex for follower
+				log.Printf("req: %v", req)
 				log.Printf("%d updating nextIndex and matchIndex for follower", rf.me)
-				log.Printf("%d before: %v, %v", rf.nextIndex, rf.matchIndex, rf.me)
+				log.Printf("%d before: %v, %v", rf.me, rf.nextIndex, rf.matchIndex)
 				rf.matchIndex[server] = req.PrevLogIndex + len(req.Entries)
 				rf.nextIndex[server] = rf.matchIndex[server] + 1
-				log.Printf("%d after: %v, %v", rf.nextIndex, rf.matchIndex, rf.me)
+				log.Printf("%d after: %v, %v", rf.me, rf.nextIndex, rf.matchIndex)
 
 				rf.updateCommitIndex()
 				//TODO: if somethign does not work;
@@ -1256,6 +1289,9 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 			rf.sendHeartBeat(leaderContext)
 			// refresh timer
 			heartbeatTimeOutCh = time.After(150 * time.Millisecond)
+
+		case req := <-rf.snapshotRequestCh:
+			rf.handleSnapshot(req)
 
 		// FIXME: remove?
 		case <-tryApplyTimeoutCh:
@@ -1315,6 +1351,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.snapshotIndex = 0
 	rf.snapshotTerm = -1
 
+	rf.snapshotRequestCh = make(chan *SnapshotRequest)
 	rf.requestVoteCh = make(chan *RequestVoteRPC)
 	rf.appendEntriesCh = make(chan *AppendEntriesRPC)
 	rf.appendEntriesReplyCh = make(chan *AppendEntriesTuple)
@@ -1384,6 +1421,6 @@ func (rf *Raft) requestVoteToPeers(ctx context.Context, req *RequestVoteArgs) <-
 }
 
 func init() {
-	log.SetOutput(ioutil.Discard)
-	log.SetFlags(0)
+	// log.SetOutput(ioutil.Discard)
+	// log.SetFlags(0)
 }
