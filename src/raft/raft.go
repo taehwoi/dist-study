@@ -200,6 +200,7 @@ type Raft struct {
 	applyCh   chan ApplyMsg
 	commandCh chan *StartRPC
 
+	mainContext    context.Context
 	mainCancelFunc func()
 }
 
@@ -249,7 +250,7 @@ func (rf *Raft) setState(term int, status status) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	log.Println("calling persist before crash")
+	log.Printf("%d calling persist before crash", rf.me)
 	// Your code here (2C).
 	// Example:
 	if len(rf.snapshot) > 0 {
@@ -795,9 +796,17 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 // the leader.
 //
 //TODO: make this to a channel, with command
+// sometimes blocks infinitely?
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	log.Println("begin start")
-	defer log.Println("done start")
+	log.Printf("%d begin start for command %v", rf.me, command)
+	defer log.Printf("%d done start for command %v", rf.me, command)
+
+	// select {
+	// // do not accept commands if being killed
+	// case <-rf.mainContext.Done():
+	// 	return -1, -1, false
+	// default:
+	// }
 
 	replyCh := make(chan *struct {
 		index    int
@@ -806,9 +815,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	})
 	startCommand := &StartRPC{command: command, replyCh: replyCh}
 
-	rf.commandCh <- startCommand
+	log.Printf("%d[%s] try put to commandCh for command %v", rf.me, rf.getStatus(), command)
+	// FIXME: this sometimes blocks indefinitely: when killed while waiting for sending on commandCh
+	// also wait for context.Done(); gracefully handling killed
+	select {
+	case rf.commandCh <- startCommand:
+	case <-rf.mainContext.Done():
+		return -1, -1, false
+	}
+	log.Printf("%d[%s] done put to commandCh for command %v", rf.me, rf.getStatus(), command)
 
 	reply := <-replyCh
+	log.Printf("%d reply for command %v", rf.me, command)
 
 	return reply.index, reply.term, reply.isLeader
 }
@@ -991,7 +1009,7 @@ func (rf *Raft) sendEmptyAppendEntriesToPeers(ctx context.Context) <-chan *Appen
 	go func() {
 		// defer close(replyCh)
 		eg.Wait()
-		log.Println("got all replies from rpc request for request vote")
+		log.Println("got all replies from rpc request for append entry")
 	}()
 
 	return rf.appendEntriesReplyCh
@@ -1127,6 +1145,7 @@ func (rf *Raft) runAsFollower(ctx context.Context) {
 			reply := &RequestVoteReply{}
 			rf.handleRequestVote(req.args, reply)
 			req.replyCh <- reply
+			close(req.replyCh)
 
 			// reset timer?
 			r = ElectionTimeOutMin + rand.Intn(ElectionTimeOutMax-ElectionTimeOutMin+1)
@@ -1137,6 +1156,7 @@ func (rf *Raft) runAsFollower(ctx context.Context) {
 			reply := &AppendEntriesReply{}
 			rf.handleAppendEntries(req.args, reply)
 			req.replyCh <- reply
+			close(req.replyCh)
 
 			// reset timer
 			r = ElectionTimeOutMin + rand.Intn(ElectionTimeOutMax-ElectionTimeOutMin+1)
@@ -1150,6 +1170,7 @@ func (rf *Raft) runAsFollower(ctx context.Context) {
 			reply := &InstallSnapshotReply{}
 			rf.handleInstallSnapshot(req.args, reply)
 			req.replyCh <- reply
+			close(req.replyCh)
 
 		case req := <-rf.commandCh:
 			index, term, isLeader := rf.handleCommand(req.command)
@@ -1163,6 +1184,7 @@ func (rf *Raft) runAsFollower(ctx context.Context) {
 				term,
 				isLeader,
 			}
+			close(req.replyCh)
 
 		case <-tryApplyTimeoutCh:
 			rf.applyToClient()
@@ -1217,6 +1239,7 @@ func (rf *Raft) runAsCandidate(ctx context.Context) {
 			// read all
 			// TEMP: avoid reading from closed channels
 			if vote == nil {
+				voteCh = nil
 				continue
 			}
 			// handle vote
@@ -1244,6 +1267,7 @@ func (rf *Raft) runAsCandidate(ctx context.Context) {
 			req.replyCh <- reply
 
 		case req := <-rf.commandCh:
+			log.Printf("%d received cmd %v as candidate", rf.me, req.command)
 			index, term, isLeader := rf.handleCommand(req.command)
 
 			req.replyCh <- &struct {
@@ -1255,6 +1279,7 @@ func (rf *Raft) runAsCandidate(ctx context.Context) {
 				term,
 				isLeader,
 			}
+			close(req.replyCh)
 
 		case req := <-rf.appendEntriesCh:
 			reply := &AppendEntriesReply{}
@@ -1319,6 +1344,7 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 			log.Printf("%d received cmd %v as leader", rf.me, req.command)
 			index, term, isLeader := rf.handleCommand(req.command)
 
+			log.Printf("%d replying to cmd %v as leader", rf.me, req.command)
 			req.replyCh <- &struct {
 				index    int
 				term     int
@@ -1328,8 +1354,10 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 				term,
 				isLeader,
 			}
+			log.Printf("%d replied to cmd %v as leader", rf.me, req.command)
 
 			// not necessary, but good
+			close(req.replyCh)
 			rf.broadcastAppendEntries(leaderContext)
 
 		case replyTup := <-rf.appendEntriesReplyCh:
@@ -1488,6 +1516,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.appendEntriesReplyCh = make(chan *AppendEntriesTuple)
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
+	rf.mainContext = ctx
 	rf.mainCancelFunc = cancelFunc
 
 	go rf.run(ctx)
