@@ -267,7 +267,7 @@ func (rf *Raft) runAsFollower(ctx context.Context) {
 	log.Printf("%d running in the main loop as follower", rf.me)
 
 	electionTimeoutCh := time.After(rf.nextElection())
-	applyTimeoutCh := time.After(10 * time.Millisecond)
+	applyTimeoutCh := time.After(50 * time.Millisecond)
 
 	for rf.getStatus() == FOLLOWER {
 		select {
@@ -311,7 +311,7 @@ func (rf *Raft) runAsFollower(ctx context.Context) {
 			rf.setStatus(CANDIDATE)
 		case <-applyTimeoutCh:
 			rf.applyToClient()
-			applyTimeoutCh = time.After(10 * time.Millisecond)
+			applyTimeoutCh = time.After(50 * time.Millisecond)
 
 		case <-ctx.Done():
 			return
@@ -332,7 +332,7 @@ func (rf *Raft) runAsCandidate(ctx context.Context) {
 	// things to do when we become a candidate
 
 	timeoutCh := time.After(rf.nextElection())
-	applyTimeoutCh := time.After(10 * time.Millisecond)
+	applyTimeoutCh := time.After(50 * time.Millisecond)
 
 	grantedVotes := 1 // includes my vote
 	votesNeeded := len(rf.peers) / 2
@@ -380,7 +380,7 @@ func (rf *Raft) runAsCandidate(ctx context.Context) {
 			req.replyCh <- reply
 
 		case req := <-rf.commandCh:
-			log.Printf("%d received cmd %v as candidate", rf.me, req.command)
+			// log.Printf("%d received cmd %v as candidate", rf.me, req.command)
 			index, term, isLeader := rf.handleCommand(req.command)
 
 			req.replyCh <- &struct {
@@ -410,7 +410,7 @@ func (rf *Raft) runAsCandidate(ctx context.Context) {
 
 		case <-applyTimeoutCh:
 			rf.applyToClient()
-			applyTimeoutCh = time.After(10 * time.Millisecond)
+			applyTimeoutCh = time.After(50 * time.Millisecond)
 
 		case <-ctx.Done():
 			return
@@ -448,8 +448,8 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 	rf.sendHeartBeat(leaderContext)
 
 	heartbeatTimeOutCh := time.After(150 * time.Millisecond)
-	tryBroadcastEntriesCh := time.After(10 * time.Millisecond)
-	applyTimeoutCh := time.After(10 * time.Millisecond)
+	tryBroadcastEntriesCh := time.After(50 * time.Millisecond)
+	applyTimeoutCh := time.After(50 * time.Millisecond)
 
 	for rf.getStatus() == LEADER {
 
@@ -460,10 +460,10 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 			req.replyCh <- reply
 
 		case req := <-rf.commandCh:
-			log.Printf("%d received cmd %v as leader", rf.me, req.command)
+			// log.Printf("%d received cmd %v as leader", rf.me, req.command)
 			index, term, isLeader := rf.handleCommand(req.command)
 
-			log.Printf("%d replying to cmd %v as leader", rf.me, req.command)
+			// log.Printf("%d replying to cmd %v as leader", rf.me, req.command)
 			req.replyCh <- &struct {
 				index    int
 				term     int
@@ -473,13 +473,13 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 				term,
 				isLeader,
 			}
-			log.Printf("%d replied to cmd %v as leader", rf.me, req.command)
+			// log.Printf("%d replied to cmd %v as leader", rf.me, req.command)
 
 			// instead of broadcasting append entries every single time a command is recieved, buffer it
 			// rf.broadcastAppendEntries(leaderContext)
 		case <-tryBroadcastEntriesCh:
 			rf.broadcastAppendEntries(leaderContext)
-			tryBroadcastEntriesCh = time.After(10 * time.Millisecond)
+			tryBroadcastEntriesCh = time.After(50 * time.Millisecond)
 
 		case replyTup := <-rf.appendEntriesReplyCh:
 			log.Printf("recieving reply from appned entries")
@@ -496,9 +496,9 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 			}
 			if reply.Success {
 				// update nextIndex and matchIndex for follower
-				log.Printf("req: %v", req)
-				log.Printf("%d updating nextIndex and matchIndex for follower", rf.me)
-				log.Printf("%d before: %v, %v", rf.me, rf.nextIndex, rf.matchIndex)
+				// log.Printf("req: %v", req)
+				// log.Printf("%d updating nextIndex and matchIndex for follower", rf.me)
+				// log.Printf("%d before: %v, %v", rf.me, rf.nextIndex, rf.matchIndex)
 				// rf.matchIndex[server] = req.PrevLogIndex + len(req.Entries)
 				if len(req.Entries) != 0 {
 					if req.PrevLogIndex+len(req.Entries) > rf.matchIndex[server] {
@@ -509,7 +509,7 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 				// if reply.LastIndex > rf.nextIndex[reply.PeerId] {
 				// 	rf.nextIndex[reply.PeerId] = reply.LastIndex
 				// }
-				log.Printf("%d after: %v, %v", rf.me, rf.nextIndex, rf.matchIndex)
+				// log.Printf("%d after: %v, %v", rf.me, rf.nextIndex, rf.matchIndex)
 
 				rf.updateCommitIndex()
 			} else { //retry, after decrementing nextIndex
@@ -523,7 +523,7 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 					}
 				}
 				rf.nextIndex[server] = Max(x, reply.FirstConflictingIndex)
-				log.Printf("%d reply was false from %d, decremented to %d, has log %v", rf.me, server, rf.nextIndex[server], rf.logs)
+				// log.Printf("%d reply was false from %d, decremented to %d, has log %v", rf.me, server, rf.nextIndex[server], rf.logs)
 				// when the leader has already discarded the next log entry that it needs to send...
 				if len(rf.logs) > 0 && rf.nextIndex[server] <= rf.logs[0].Index {
 					log.Printf("asking for install snapshot")
@@ -570,7 +570,7 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 
 		case <-applyTimeoutCh:
 			rf.applyToClient()
-			applyTimeoutCh = time.After(10 * time.Millisecond)
+			applyTimeoutCh = time.After(50 * time.Millisecond)
 
 		case <-ctx.Done():
 			return
@@ -939,7 +939,7 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		// log.Printf("%d can vote for %d, check logs %v", rf.me, args.CandidateId, rf.logs)
-		log.Printf("%d can vote for %d, args: %v", rf.me, args.CandidateId, args)
+		// log.Printf("%d can vote for %d, args: %v", rf.me, args.CandidateId, args)
 		var lastLogIndex int
 		var lastLogTerm int
 		if len(rf.logs) == 0 {
@@ -1052,7 +1052,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	reply.Term = rf.getTerm()
 	reply.Success = false
 
-	log.Printf("%d, args: %v", rf.me, args)
+	// log.Printf("%d, args: %v", rf.me, args)
 	// log.Printf("%d's current logs: %v, pli: %d", rf.me, rf.logs, args.PrevLogIndex)
 
 	// 1. reply false if term < currentTerm
@@ -1063,7 +1063,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	}
 
 	if args.PrevLogIndex > len(rf.logs)+rf.snapshotIndex {
-		log.Printf("%d reply false because previous log Index is more than what i have %d %v", rf.me, rf.snapshotIndex, rf.logs)
+		// log.Printf("%d reply false because previous log Index is more than what i have %d %v", rf.me, rf.snapshotIndex, rf.logs)
 		reply.Success = false
 		return
 	}
@@ -1164,7 +1164,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	})
 	startCommand := &StartRPC{command: command, replyCh: replyCh}
 
-	log.Printf("%d[%s] try put to commandCh for command %v", rf.me, rf.getStatus(), command)
+	// log.Printf("%d[%s] try put to commandCh for command %v", rf.me, rf.getStatus(), command)
 	// FIXME: this sometimes blocks indefinitely: when killed while waiting for sending on commandCh
 	// also wait for context.Done(); gracefully handling killed
 	select {
@@ -1172,11 +1172,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	case <-rf.mainContext.Done():
 		return -1, -1, false
 	}
-	log.Printf("%d[%s] done put to commandCh for command %v", rf.me, rf.getStatus(), command)
+	// log.Printf("%d[%s] done put to commandCh for command %v", rf.me, rf.getStatus(), command)
 
 	reply := <-replyCh
 	close(replyCh)
-	log.Printf("%d reply for command %v", rf.me, command)
+	// log.Printf("%d reply for command %v", rf.me, command)
 
 	return reply.index, reply.term, reply.isLeader
 }
@@ -1191,7 +1191,7 @@ func (rf *Raft) handleCommand(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 
-	log.Printf("%d received command %v", rf.me, command)
+	// log.Printf("%d received command %v", rf.me, command)
 	entry := &Log{
 		Term:    term,
 		Index:   index,
@@ -1207,7 +1207,7 @@ func (rf *Raft) handleCommand(command interface{}) (int, int, bool) {
 // should be called in the main thread
 func (rf *Raft) broadcastAppendEntries(ctx context.Context) <-chan *AppendEntriesTuple {
 
-	log.Printf("%d, broadcastAppendEntries NextIndex: %v", rf.me, rf.nextIndex)
+	// log.Printf("%d, broadcastAppendEntries NextIndex: %v", rf.me, rf.nextIndex)
 
 	for idx := range rf.peers {
 		server := idx
@@ -1227,16 +1227,11 @@ func (rf *Raft) broadcastAppendEntries(ctx context.Context) <-chan *AppendEntrie
 			entries := make([]*Log, 0)
 
 			next := rf.nextIndex[server]
-			log.Printf("---------------------------------")
-			// log.Printf("%v", rf.logs)
-			// log.Printf("%d", rf.snapshotIndex)
 			if next-rf.snapshotIndex >= 1 {
 				entries = append(entries, rf.logs[next-1-rf.snapshotIndex:]...)
 			} else if len(rf.logs) > 0 && rf.logs[0].Index > next {
 				continue
 			}
-			log.Printf("---------------------------------")
-			// log.Printf("%v", entries)
 			rf.appendEntries(ctx, server, entries)
 		}
 	}
@@ -1312,16 +1307,17 @@ func (rf *Raft) updateCommitIndex() {
 
 	for N := rf.commitIndex + 1; N <= len(rf.logs)+rf.snapshotIndex; N++ {
 		count := 1 // 1 for leader
-		log.Printf("%d N: %d, matchIndex: %v", rf.me, N, rf.matchIndex)
+		// log.Printf("%d N: %d, matchIndex: %v", rf.me, N, rf.matchIndex)
 		for idx := range rf.peers {
 			if idx != rf.me && rf.matchIndex[idx] >= N {
 				count++
 			}
 		}
-		log.Printf("%d N: %d, matchIndex: %v, count %d", rf.me, N, rf.matchIndex, count)
+		// log.Printf("%d N: %d, matchIndex: %v, count %d", rf.me, N, rf.matchIndex, count)
 		if count > len(rf.peers)/2 && rf.logs[N-1-rf.snapshotIndex].Term == rf.currentTerm {
 			rf.commitIndex = N
 			log.Printf("%d found a suitable N: %d", rf.me, N)
+			// we don't need to call applyClient here, because broadcastAppendEntries will handle it
 			// rf.applyToClient()
 		}
 	}
