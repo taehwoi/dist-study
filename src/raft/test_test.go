@@ -61,16 +61,16 @@ func TestReElection2A(t *testing.T) {
 
 	cfg.begin("Test (2A): election after network failure")
 
-	fmt.Println("check One leader")
+	// fmt.Println("check One leader")
 	leader1 := cfg.checkOneLeader()
-	fmt.Println("check One leader done")
+	// fmt.Println("check One leader done")
 
 	// if the leader disconnects, a new one should be elected.
 	cfg.disconnect(leader1)
-	fmt.Println("disconnected")
+	// fmt.Println("disconnected")
 	cfg.checkOneLeader()
 
-	fmt.Println("check one leader success")
+	// fmt.Println("check one leader success")
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader. and the old leader
 	// should switch to follower.
@@ -79,12 +79,12 @@ func TestReElection2A(t *testing.T) {
 
 	// if there's no quorum, no new leader should
 	// be elected.
-	fmt.Println("no quorum, no leader")
+	// fmt.Println("no quorum, no leader")
 	cfg.disconnect(leader2)
 	cfg.disconnect((leader2 + 1) % servers)
 	time.Sleep(2 * RaftElectionTimeout)
 
-	fmt.Println("check no leader")
+	// fmt.Println("check no leader")
 	// check that the one connected server
 	// does not think it is the leader.
 	cfg.checkNoLeader()
@@ -212,16 +212,16 @@ func TestFollowerFailure2B(t *testing.T) {
 	cfg.begin("Test (2B): test progressive failure of followers")
 
 	cfg.one(101, servers, false)
-	fmt.Println("agree on one")
+	// fmt.Println("agree on one")
 
 	// disconnect one follower from the network.
-	fmt.Println("check on leader")
+	// fmt.Println("check on leader")
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect((leader1 + 1) % servers)
 
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
-	fmt.Println("even with one less follower, can agree")
+	// fmt.Println("even with one less follower, can agree")
 	cfg.one(102, servers-1, false)
 	time.Sleep(RaftElectionTimeout)
 	cfg.one(103, servers-1, false)
@@ -547,30 +547,30 @@ func TestRejoin2B(t *testing.T) {
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect(leader1)
-	fmt.Println("leader disconnected")
+	// fmt.Println("leader disconnected")
 
 	// make old leader try to agree on some entries
-	fmt.Println("send command to old leader")
+	// fmt.Println("send command to old leader")
 	cfg.rafts[leader1].Start(102)
 	cfg.rafts[leader1].Start(103)
 	cfg.rafts[leader1].Start(104)
 
-	fmt.Println("new leader commits")
+	// fmt.Println("new leader commits")
 	// new leader commits, also for index=2
 	cfg.one(103, 2, true)
 
 	// new leader network failure
-	fmt.Println("----------------new leader network failure-------")
+	// fmt.Println("----------------new leader network failure-------")
 	leader2 := cfg.checkOneLeader()
 	cfg.disconnect(leader2)
 	// fmt.Printf("%d leader disconnected\n", leader2)
 
-	fmt.Println("----------------old leader connected again-------")
+	// fmt.Println("----------------old leader connected again-------")
 	// old leader connected again
 	cfg.connect(leader1)
 	// fmt.Printf("%d leader connected again\n", leader1)
 
-	fmt.Println("try agreement on 104")
+	// fmt.Println("try agreement on 104")
 	// fmt.Printf("check (0)\n")
 	// for server, val := range cfg.rafts {
 	// 	val.mu.Lock()

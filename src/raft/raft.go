@@ -53,29 +53,6 @@ const (
 	ElectionTimeOutMax = ElectionTimeOutMin + 100
 )
 
-type status int32
-
-const (
-	UNDEFINED status = iota
-	LEADER
-	CANDIDATE
-	FOLLOWER
-)
-
-func (s status) String() string {
-	switch s {
-	case UNDEFINED:
-		return "UNDEFINED"
-	case LEADER:
-		return "LEADER"
-	case CANDIDATE:
-		return "CANDIDATE"
-	case FOLLOWER:
-		return "FOLLOWER"
-	}
-	return "UNKNOWN"
-}
-
 type Log struct {
 	Term    int
 	Index   int
@@ -103,6 +80,7 @@ type ApplyMsg struct {
 
 type StartRPC struct {
 	command interface{}
+	//TODO: use Start Reply
 	replyCh chan *struct {
 		index    int
 		term     int
@@ -147,14 +125,13 @@ type AppendEntriesTuple struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	// mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 
 	// protects status and currentTerm together
 	// since this two field can be accessed outside the main thread
-	stateLock   sync.Mutex
+	stateLock   sync.RWMutex
 	status      status // Leader, Follower, Candidate
 	currentTerm int
 
@@ -175,12 +152,6 @@ type Raft struct {
 	snapshot      []byte
 	snapshotIndex int
 	snapshotTerm  int
-	// prevSnapshotTerm  int
-	// PrevSnapshotIndex int
-
-	// notifies that a heartbeat from the leader has arrived
-	heartbeatCh   chan struct{}
-	voteRequestCh chan struct{}
 
 	appendEntriesCh chan *AppendEntriesRPC
 
@@ -213,12 +184,404 @@ type Data struct {
 	SnapshotTerm  int
 }
 
+//
+// the service or tester wants to create a Raft server. the ports
+// of all the Raft servers (including this one) are in peers[]. this
+// server's port is peers[me]. all the servers' peers[] arrays
+// have the same order. persister is a place for this server to
+// save its persistent state, and also initially holds the most
+// recent saved state, if any. applyCh is a channel on which the
+// tester or service expects Raft to send ApplyMsg messages.
+// Make() must return quickly, so it should start goroutines
+// for any long-running work.
+//
+func Make(peers []*labrpc.ClientEnd, me int,
+	persister *Persister, applyCh chan ApplyMsg) *Raft {
+
+	rf := &Raft{}
+	rf.peers = peers
+	rf.persister = persister
+	rf.me = me
+
+	// Your initialization code here (2A, 2B, 2C).
+	rf.currentTerm = 0
+	rf.votedFor = -1
+
+	rf.applyCh = applyCh
+
+	rf.commandCh = make(chan *StartRPC)
+
+	rf.snapshotIndex = 0
+	rf.snapshotTerm = -1
+
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+	// 2D
+	rf.snapshot = persister.ReadSnapshot()
+
+	// when starting from snapshot, this should be updated
+	rf.commitIndex = rf.snapshotIndex
+	rf.lastApplied = rf.snapshotIndex
+
+	rf.snapshotRequestCh = make(chan *SnapshotRequest)
+	rf.installSnapshotCh = make(chan *InstallSnapshotRPC)
+	rf.requestVoteCh = make(chan *RequestVoteRPC)
+	rf.appendEntriesCh = make(chan *AppendEntriesRPC)
+
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	rf.mainContext = ctx
+	rf.mainCancelFunc = cancelFunc
+
+	go rf.run(ctx)
+
+	return rf
+}
+
+// run the main thread that handles leadership and RPC requests.
+func (rf *Raft) run(ctx context.Context) {
+	log.Printf("%d starting the main loop", rf.me)
+
+	// every one is follower in the beginning
+	rf.setStatus(FOLLOWER)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		switch rf.getStatus() {
+		case FOLLOWER:
+			rf.runAsFollower(ctx)
+		case CANDIDATE:
+			rf.runAsCandidate(ctx)
+		case LEADER:
+			rf.runAsLeader(ctx)
+		}
+	}
+}
+
+// runFollower runs the main loop while in the follower state.
+func (rf *Raft) runAsFollower(ctx context.Context) {
+	log.Printf("%d running in the main loop as follower", rf.me)
+
+	electionTimeoutCh := time.After(rf.nextElection())
+	applyTimeoutCh := time.After(10 * time.Millisecond)
+
+	for rf.getStatus() == FOLLOWER {
+		select {
+		case req := <-rf.requestVoteCh:
+			reply := &RequestVoteReply{}
+			rf.handleRequestVote(req.args, reply)
+			req.replyCh <- reply
+
+			electionTimeoutCh = time.After(rf.nextElection())
+
+		case req := <-rf.appendEntriesCh:
+			reply := &AppendEntriesReply{}
+			rf.handleAppendEntries(req.args, reply)
+			req.replyCh <- reply
+
+			electionTimeoutCh = time.After(rf.nextElection())
+
+		case req := <-rf.snapshotRequestCh:
+			rf.handleSnapshot(req)
+
+		case req := <-rf.installSnapshotCh:
+			reply := &InstallSnapshotReply{}
+			rf.handleInstallSnapshot(req.args, reply)
+			req.replyCh <- reply
+
+		case req := <-rf.commandCh:
+			index, term, isLeader := rf.handleCommand(req.command)
+
+			req.replyCh <- &struct {
+				index    int
+				term     int
+				isLeader bool
+			}{
+				index,
+				term,
+				isLeader,
+			}
+
+		// electionTimeOut expired
+		case <-electionTimeoutCh:
+			rf.setStatus(CANDIDATE)
+		case <-applyTimeoutCh:
+			rf.applyToClient()
+			applyTimeoutCh = time.After(10 * time.Millisecond)
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (rf *Raft) nextElection() time.Duration {
+	r := ElectionTimeOutMin + rand.Intn(ElectionTimeOutMax-ElectionTimeOutMin+1)
+	t := time.Duration(r) * time.Millisecond
+
+	return t
+}
+
+// runCandidate runs the main loop while in the candidate state.
+func (rf *Raft) runAsCandidate(ctx context.Context) {
+	log.Printf("%d running in the main loop as candidate", rf.me)
+	// things to do when we become a candidate
+
+	timeoutCh := time.After(rf.nextElection())
+	applyTimeoutCh := time.After(10 * time.Millisecond)
+
+	grantedVotes := 1 // includes my vote
+	votesNeeded := len(rf.peers) / 2
+
+	voteCh := rf.startElection(ctx)
+
+	for rf.getStatus() == CANDIDATE {
+		select {
+		case req := <-rf.requestVoteCh:
+			reply := &RequestVoteReply{}
+			rf.handleRequestVote(req.args, reply)
+			req.replyCh <- reply
+
+			// reset timer
+			timeoutCh = time.After(rf.nextElection())
+		// instead of waiting for the entire votes, wait for seperate votes
+		case vote := <-voteCh:
+			// read all
+			// TEMP: avoid reading from closed channels
+			if vote == nil {
+				voteCh = nil
+				continue
+			}
+			// handle vote
+			if vote.Term > rf.getTerm() {
+				log.Printf("%d found a higher term stepping down\n", rf.me)
+				rf.handleHigherTermFound(vote.Term)
+				return
+			}
+
+			if vote.VoteGranted {
+				grantedVotes++
+			}
+			if grantedVotes > votesNeeded {
+				log.Printf("%d recieved %d / %d votes\n", rf.me, grantedVotes, len(rf.peers))
+				rf.setStatus(LEADER)
+			}
+
+		case req := <-rf.snapshotRequestCh:
+			rf.handleSnapshot(req)
+
+		case req := <-rf.installSnapshotCh:
+			reply := &InstallSnapshotReply{}
+			rf.handleInstallSnapshot(req.args, reply)
+			req.replyCh <- reply
+
+		case req := <-rf.commandCh:
+			log.Printf("%d received cmd %v as candidate", rf.me, req.command)
+			index, term, isLeader := rf.handleCommand(req.command)
+
+			req.replyCh <- &struct {
+				index    int
+				term     int
+				isLeader bool
+			}{
+				index,
+				term,
+				isLeader,
+			}
+
+		case req := <-rf.appendEntriesCh:
+			reply := &AppendEntriesReply{}
+			rf.handleAppendEntries(req.args, reply)
+
+			req.replyCh <- reply
+			// If AppendEntries RPC received from new leader: convert to follower
+			if req.args.Term >= rf.getTerm() {
+				log.Printf("%d received valid heartbeat from %d\n", rf.me, req.args.LeaderId)
+				rf.setStatus(FOLLOWER)
+			}
+
+		case <-timeoutCh:
+			// return as candidate, which will restart the voting process
+			return
+
+		case <-applyTimeoutCh:
+			rf.applyToClient()
+			applyTimeoutCh = time.After(10 * time.Millisecond)
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// runCandidate runs the main loop while in the leader state.
+func (rf *Raft) runAsLeader(ctx context.Context) {
+	log.Printf("%d running in the main loop as leader", rf.me)
+
+	// things to do when we first become a leader
+	// 1) init nextIndex to leader last log index + 1
+	var leaderLastIndex int
+	if len(rf.logs) == 0 {
+		leaderLastIndex = rf.snapshotIndex
+	} else {
+		leaderLastIndex = rf.logs[len(rf.logs)-1].Index
+	}
+	rf.nextIndex = make([]int, len(rf.peers))
+	for idx := range rf.nextIndex {
+		rf.nextIndex[idx] = leaderLastIndex + 1
+	}
+
+	// 2) init matchIndex to 0
+	rf.matchIndex = make([]int, len(rf.peers))
+
+	// init leader only channels
+	rf.appendEntriesReplyCh = make(chan *AppendEntriesTuple)
+	rf.installSnapshotReplyCh = make(chan *InstallSnapshotReplyWithServer)
+
+	// send heart beat as new leader, once
+	leaderContext, leaderCancel := context.WithCancel(ctx)
+	defer leaderCancel()
+	rf.sendHeartBeat(leaderContext)
+
+	heartbeatTimeOutCh := time.After(150 * time.Millisecond)
+	tryBroadcastEntriesCh := time.After(10 * time.Millisecond)
+	applyTimeoutCh := time.After(10 * time.Millisecond)
+
+	for rf.getStatus() == LEADER {
+
+		select {
+		case req := <-rf.requestVoteCh:
+			reply := &RequestVoteReply{}
+			rf.handleRequestVote(req.args, reply)
+			req.replyCh <- reply
+
+		case req := <-rf.commandCh:
+			log.Printf("%d received cmd %v as leader", rf.me, req.command)
+			index, term, isLeader := rf.handleCommand(req.command)
+
+			log.Printf("%d replying to cmd %v as leader", rf.me, req.command)
+			req.replyCh <- &struct {
+				index    int
+				term     int
+				isLeader bool
+			}{
+				index,
+				term,
+				isLeader,
+			}
+			log.Printf("%d replied to cmd %v as leader", rf.me, req.command)
+
+			// instead of broadcasting append entries every single time a command is recieved, buffer it
+			// rf.broadcastAppendEntries(leaderContext)
+		case <-tryBroadcastEntriesCh:
+			rf.broadcastAppendEntries(leaderContext)
+			tryBroadcastEntriesCh = time.After(10 * time.Millisecond)
+
+		case replyTup := <-rf.appendEntriesReplyCh:
+			log.Printf("recieving reply from appned entries")
+			reply := replyTup.reply
+			req := replyTup.args
+			server := replyTup.server
+			if rf.getTerm() > reply.Term || rf.getTerm() > req.Term {
+				log.Printf("%d received an old reply\n", rf.me)
+				continue
+			}
+			if reply.Term > rf.getTerm() {
+				rf.handleHigherTermFound(reply.Term)
+				return
+			}
+			if reply.Success {
+				// update nextIndex and matchIndex for follower
+				log.Printf("req: %v", req)
+				log.Printf("%d updating nextIndex and matchIndex for follower", rf.me)
+				log.Printf("%d before: %v, %v", rf.me, rf.nextIndex, rf.matchIndex)
+				// rf.matchIndex[server] = req.PrevLogIndex + len(req.Entries)
+				if len(req.Entries) != 0 {
+					if req.PrevLogIndex+len(req.Entries) > rf.matchIndex[server] {
+						rf.matchIndex[server] = req.PrevLogIndex + len(req.Entries)
+						rf.nextIndex[server] = rf.matchIndex[server] + 1
+					}
+				}
+				// if reply.LastIndex > rf.nextIndex[reply.PeerId] {
+				// 	rf.nextIndex[reply.PeerId] = reply.LastIndex
+				// }
+				log.Printf("%d after: %v, %v", rf.me, rf.nextIndex, rf.matchIndex)
+
+				rf.updateCommitIndex()
+			} else { //retry, after decrementing nextIndex
+				log.Printf("%d reply was false from %d, try decrement", rf.me, server)
+
+				// decrement nextIndex
+				x := rf.snapshotIndex + 1
+				for _, val := range rf.logs {
+					if val.Term == reply.ConflictingTerm {
+						x = val.Index
+					}
+				}
+				rf.nextIndex[server] = Max(x, reply.FirstConflictingIndex)
+				log.Printf("%d reply was false from %d, decremented to %d, has log %v", rf.me, server, rf.nextIndex[server], rf.logs)
+				// when the leader has already discarded the next log entry that it needs to send...
+				if len(rf.logs) > 0 && rf.nextIndex[server] <= rf.logs[0].Index {
+					log.Printf("asking for install snapshot")
+					rf.requestInstallSnapshot(leaderContext, server)
+				}
+
+				// decremented nextIndex; will be retried on next broadcast timeout
+				// entries := make([]*Log, 0)
+
+				// next := rf.nextIndex[server]
+				// if next-rf.snapshotIndex >= 1 {
+				// entries = append(entries, rf.logs[next-1-rf.snapshotIndex:]...)
+				// } else if len(rf.logs) > 0 && rf.logs[0].Index > next {
+				// continue
+				// }
+				// rf.appendEntries(ctx, server, entries)
+			}
+
+		case <-heartbeatTimeOutCh:
+			rf.sendHeartBeat(leaderContext)
+			// refresh timer
+			heartbeatTimeOutCh = time.After(150 * time.Millisecond)
+
+		case req := <-rf.snapshotRequestCh:
+			rf.handleSnapshot(req)
+
+		// maybe we don't have to handle this rpc?
+		case req := <-rf.installSnapshotCh:
+			reply := &InstallSnapshotReply{}
+			rf.handleInstallSnapshot(req.args, reply)
+			req.replyCh <- reply
+
+		case reply := <-rf.installSnapshotReplyCh:
+			if reply.reply.Term > rf.currentTerm {
+				fmt.Println("recieved reply")
+				rf.handleHigherTermFound(reply.reply.Term)
+				// continue
+			}
+
+		case req := <-rf.appendEntriesCh:
+			reply := &AppendEntriesReply{}
+			rf.handleAppendEntries(req.args, reply)
+			req.replyCh <- reply
+
+		case <-applyTimeoutCh:
+			rf.applyToClient()
+			applyTimeoutCh = time.After(10 * time.Millisecond)
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // only called from the main thread
 func (rf *Raft) handleHigherTermFound(term int) {
-	// update term
-
-	rf.setState(term, FOLLOWER)
-	// since we updated term, we reset votedFor; we haven't voted for anyone in this new term (yet)
+	rf.setTermAndStatus(term, FOLLOWER)
+	// since we updated term, we reset votedFor; we haven't voted for anyone in this new term
 	rf.votedFor = -1
 	rf.persist()
 }
@@ -226,15 +589,15 @@ func (rf *Raft) handleHigherTermFound(term int) {
 func (rf *Raft) GetState() (int, bool) {
 	log.Println("GetState called")
 
-	rf.stateLock.Lock()
-	defer rf.stateLock.Unlock()
+	rf.stateLock.RLock()
+	defer rf.stateLock.RUnlock()
 
 	log.Printf("%d: currentTerm %d, status %s", rf.me, rf.currentTerm, rf.status)
 
 	return rf.currentTerm, rf.status == LEADER
 }
 
-func (rf *Raft) setState(term int, status status) {
+func (rf *Raft) setTermAndStatus(term int, status status) {
 	log.Println("setState called")
 	rf.stateLock.Lock()
 	defer rf.stateLock.Unlock()
@@ -250,9 +613,10 @@ func (rf *Raft) setState(term int, status status) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	log.Printf("%d calling persist before crash", rf.me)
+	// log.Printf("%d calling persist before crash", rf.me)
 	// Your code here (2C).
 	// Example:
+	//TODO: remove this if
 	if len(rf.snapshot) > 0 {
 		w := new(bytes.Buffer)
 		e := labgob.NewEncoder(w)
@@ -297,19 +661,8 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.setTerm(buf.CurrentTerm)
 		rf.votedFor = buf.VotedFor
 		rf.logs = buf.Logs
-		// TODO: is this needed?
-		// rf.prevSnapshotTerm = buf.PrevSnapshotTerm
-		// rf.PrevSnapshotIndex = buf.PrevSnapshotIndex
-		// fmt.Println("----------------------------")
 		rf.snapshotIndex = buf.SnapshotIndex
 		rf.snapshotTerm = buf.SnapshotTerm
-		// fmt.Println(buf.SnapshotIndex)
-		// fmt.Println(buf.SnapshotTerm)
-		// fmt.Println("----------------------------")
-
-		// truncate logs if already applied in snapshot
-		// log.Printf("read persist..!")
-		// log.Printf("%v", buf)
 	}
 }
 
@@ -353,7 +706,7 @@ func (rf *Raft) handleSnapshot(req *SnapshotRequest) {
 	toKeep := index + 1
 
 	//FIXME?
-	if len(rf.logs) < index-1-rf.snapshotIndex {
+	if index-1-rf.snapshotIndex < 0 || len(rf.logs) < index-1-rf.snapshotIndex {
 		rf.snapshotTerm = -1
 	} else {
 		rf.snapshotTerm = rf.logs[index-1-rf.snapshotIndex].Term
@@ -431,25 +784,6 @@ type InstallSnapshotRequest struct {
 
 type InstallSnapshotReply struct {
 	Term int
-}
-
-//
-// InstallSnapshot RPC handler.
-//
-func (rf *Raft) InstallSnapshot(args *InstallSnapshotRequest, reply *InstallSnapshotReply) {
-	log.Printf("%d recieved install snapshot request", rf.me)
-	replyCh := make(chan *InstallSnapshotReply)
-
-	// send a message to the main thread to process this request
-	rf.installSnapshotCh <- &InstallSnapshotRPC{
-		args:    args,
-		replyCh: replyCh,
-	}
-
-	// wait for main loop's result
-	res := <-replyCh
-
-	reply.Term = res.Term
 }
 
 // should only be called in the main thread
@@ -534,10 +868,54 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// wait for main loop's result
 	res := <-replyCh
+	close(replyCh)
 
 	// return reply
 	reply.Term = res.Term
 	reply.VoteGranted = res.VoteGranted
+}
+
+//
+// InstallSnapshot RPC handler.
+//
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotRequest, reply *InstallSnapshotReply) {
+	log.Printf("%d recieved install snapshot request", rf.me)
+	replyCh := make(chan *InstallSnapshotReply)
+
+	// send a message to the main thread to process this request
+	rf.installSnapshotCh <- &InstallSnapshotRPC{
+		args:    args,
+		replyCh: replyCh,
+	}
+
+	// wait for main loop's result
+	res := <-replyCh
+	close(replyCh)
+
+	reply.Term = res.Term
+}
+
+//
+// AppendEntries RPC handler.
+//
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	replyCh := make(chan *AppendEntriesReply)
+
+	// send a message to the main thread to process this request
+	rf.appendEntriesCh <- &AppendEntriesRPC{
+		args:    args,
+		replyCh: replyCh,
+	}
+
+	// wait for main loop's result
+	res := <-replyCh
+	close(replyCh)
+
+	// return reply
+	reply.ConflictingTerm = res.ConflictingTerm
+	reply.FirstConflictingIndex = res.FirstConflictingIndex
+	reply.Success = res.Success
+	reply.Term = res.Term
 }
 
 // should only be called from the main thread
@@ -662,25 +1040,6 @@ func (rf *Raft) sendInstallSnapshot(
 	return ok
 }
 
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	replyCh := make(chan *AppendEntriesReply)
-
-	// send a message to the main thread to process this request
-	rf.appendEntriesCh <- &AppendEntriesRPC{
-		args:    args,
-		replyCh: replyCh,
-	}
-
-	// wait for main loop's result
-	res := <-replyCh
-
-	// return reply
-	reply.ConflictingTerm = res.ConflictingTerm
-	reply.FirstConflictingIndex = res.FirstConflictingIndex
-	reply.Success = res.Success
-	reply.Term = res.Term
-}
-
 // only called from the main thread
 func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
@@ -692,19 +1051,6 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 
 	reply.Term = rf.getTerm()
 	reply.Success = false
-
-	// when in candidate
-	if rf.getStatus() == CANDIDATE && args.Term >= rf.getTerm() {
-		log.Printf("%d received valid heartbeat from %d\n", rf.me, args.LeaderId)
-		// rf.handleHigherTermFound(args.Term)
-		// received heartbeat
-		// go func() {
-		// rf.heartbeatCh <- struct{}{}
-		// }()
-		// rf.handleEvent(rf.mainContext, CURRENT_LEADER_FOUND, 0)
-		// rf.handleHigherTermFound(args.Term)
-		rf.setStatus(FOLLOWER)
-	}
 
 	log.Printf("%d, args: %v", rf.me, args)
 	// log.Printf("%d's current logs: %v, pli: %d", rf.me, rf.logs, args.PrevLogIndex)
@@ -728,7 +1074,8 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		reply.ConflictingTerm = rf.logs[args.PrevLogIndex-rf.snapshotIndex-1].Term
 		for _, val := range rf.logs {
 			if val.Term == reply.ConflictingTerm {
-				reply.FirstConflictingIndex = val.Index + 1
+				// reply.FirstConflictingIndex = val.Index + 1
+				reply.FirstConflictingIndex = val.Index + 0
 				break
 			}
 		}
@@ -737,16 +1084,16 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 
 	reply.Success = true
 
-	//FIXME!
 	for _, val := range args.Entries {
-		if val.Index > len(rf.logs)+rf.snapshotIndex {
-			break //FIXME?
+		i := val.Index - rf.snapshotIndex - 1
+		if i < 0 || i >= len(rf.logs) {
+			break
 		}
 		// same index, but diffrent terms
-		if rf.logs[val.Index-1-rf.snapshotIndex].Term != val.Term {
+		if rf.logs[i].Term != val.Term {
 			// delete the existing entry and all that follow it
 			// by only retaining the entries before it
-			rf.logs = rf.logs[:val.Index-1-rf.snapshotIndex]
+			rf.logs = rf.logs[:i]
 			rf.persist()
 			break
 		}
@@ -756,12 +1103,14 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	if len(rf.logs) > 0 {
 		lastNewEntryIndex = rf.logs[len(rf.logs)-1].Index
 	} else {
+		// FIXME
 		lastNewEntryIndex = math.MaxInt
 		// lastNewEntryIndex = rf.snapshotIndex
 	}
 	for _, val := range args.Entries {
 		if val.Index > len(rf.logs)+rf.snapshotIndex {
-			log.Printf("%d appending %v to %v", rf.me, val, rf.logs)
+			// log.Printf("%d appending %v to %v", rf.me, val, rf.logs)
+			// log.Printf("%d appending %v", rf.me, val)
 			rf.logs = append(rf.logs, val)
 			rf.persist()
 		}
@@ -775,7 +1124,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		rf.commitIndex = Min(args.LeaderCommit, lastNewEntryIndex)
 		log.Printf("%d new commit index %d", rf.me, rf.commitIndex)
 		// if prev != rf.commitIndex {
-		// 	rf.applyToClient()
+		// rf.applyToClient()
 		// }
 	}
 
@@ -826,6 +1175,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	log.Printf("%d[%s] done put to commandCh for command %v", rf.me, rf.getStatus(), command)
 
 	reply := <-replyCh
+	close(replyCh)
 	log.Printf("%d reply for command %v", rf.me, command)
 
 	return reply.index, reply.term, reply.isLeader
@@ -855,72 +1205,9 @@ func (rf *Raft) handleCommand(command interface{}) (int, int, bool) {
 }
 
 // should be called in the main thread
-func (rf *Raft) singleAppendEntries(ctx context.Context, server int) <-chan *AppendEntriesTuple {
-	reply := AppendEntriesReply{}
-
-	var lastLogIndex int
-	if len(rf.logs) == 0 {
-		lastLogIndex = rf.snapshotIndex
-	} else {
-		lastLogIndex = rf.logs[len(rf.logs)-1].Index
-	}
-
-	if lastLogIndex >= rf.nextIndex[server] {
-		entries := make([]*Log, 0)
-
-		next := rf.nextIndex[server]
-		if next-rf.snapshotIndex >= 1 {
-			entries = append(entries, rf.logs[next-1-rf.snapshotIndex:]...)
-		} else if len(rf.logs) > 0 && rf.logs[0].Index > next {
-			// rf.requestInstallSnapshot(ctx, server)
-			return rf.appendEntriesReplyCh
-			// continue
-			// return
-		}
-
-		var prevLogIndex int
-		var prevLogTerm int
-
-		// FIXME?
-		if next-rf.snapshotIndex <= 1 {
-			prevLogIndex = rf.snapshotIndex
-			prevLogTerm = rf.snapshotTerm
-		} else {
-			prevLogIndex = rf.logs[next-rf.snapshotIndex-2].Index
-			prevLogTerm = rf.logs[next-rf.snapshotIndex-2].Term
-		}
-		req := &AppendEntriesArgs{
-			Term:         rf.getTerm(),
-			LeaderId:     rf.me,
-			Entries:      entries,
-			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  prevLogTerm,
-			LeaderCommit: rf.commitIndex,
-		}
-
-		go func() {
-			if len(req.Entries) <= 0 {
-				return
-			}
-			if ok := rf.sendAppendEntries(ctx, server, req, &reply); !ok {
-				log.Printf("%d failed rpc request for appendEntry\n", rf.me)
-				reply = AppendEntriesReply{}
-			}
-			rf.appendEntriesReplyCh <- &AppendEntriesTuple{reply: &reply, args: req, server: server}
-		}()
-	}
-
-	return rf.appendEntriesReplyCh
-}
-
-// should be called in the main thread
 func (rf *Raft) broadcastAppendEntries(ctx context.Context) <-chan *AppendEntriesTuple {
 
 	log.Printf("%d, broadcastAppendEntries NextIndex: %v", rf.me, rf.nextIndex)
-
-	// we actually need rf.peers - 1, but this makes indexing easier
-	// replies := make([]AppendEntriesReply, len(rf.peers))
-	// replyCh := make(chan *AppendEntriesReply, len(rf.peers)-1)
 
 	for idx := range rf.peers {
 		server := idx
@@ -928,51 +1215,58 @@ func (rf *Raft) broadcastAppendEntries(ctx context.Context) <-chan *AppendEntrie
 			continue
 		}
 
-		rf.singleAppendEntries(ctx, server)
+		var lastLogIndex int
+		if len(rf.logs) == 0 {
+			lastLogIndex = rf.snapshotIndex
+		} else {
+			lastLogIndex = rf.logs[len(rf.logs)-1].Index
+		}
+
+		if lastLogIndex >= rf.nextIndex[server] {
+
+			entries := make([]*Log, 0)
+
+			next := rf.nextIndex[server]
+			log.Printf("---------------------------------")
+			// log.Printf("%v", rf.logs)
+			// log.Printf("%d", rf.snapshotIndex)
+			if next-rf.snapshotIndex >= 1 {
+				entries = append(entries, rf.logs[next-1-rf.snapshotIndex:]...)
+			} else if len(rf.logs) > 0 && rf.logs[0].Index > next {
+				continue
+			}
+			log.Printf("---------------------------------")
+			// log.Printf("%v", entries)
+			rf.appendEntries(ctx, server, entries)
+		}
 	}
 	return rf.appendEntriesReplyCh
-}
-
-//
-// the tester doesn't halt goroutines created by Raft after each test,
-// but it does call the Kill() method. your code can use killed() to
-// check whether Kill() has been called. the use of atomic avoids the
-// need for a lock.
-//
-// the issue is that long-running goroutines use memory and may chew
-// up CPU time, perhaps causing later tests to fail and generating
-// confusing debug output. any goroutine with a long-running loop
-// should call killed() to check whether it should stop.
-//
-func (rf *Raft) Kill() {
-	rf.mainCancelFunc()
 }
 
 // only called in the main thread
 func (rf *Raft) sendHeartBeat(ctx context.Context) <-chan *AppendEntriesTuple {
 	log.Printf("%d: sending heartbeat\n", rf.me)
-	return rf.sendEmptyAppendEntriesToPeers(ctx)
-}
-
-func (rf *Raft) sendEmptyAppendEntriesToPeers(ctx context.Context) <-chan *AppendEntriesTuple {
-
-	// we actually need rf.peers - 1, but this makes indexing easier
-	replies := make([]AppendEntriesReply, len(rf.peers))
-	// replyCh := make(chan *AppendEntriesReply, len(rf.peers)-1)
-	term := rf.getTerm()
-
-	eg, _ := errgroup.WithContext(ctx)
 	for idx := range rf.peers {
 		server := idx
 		if server == rf.me {
 			continue
 		}
+		// send empty entries
+		rf.appendEntries(ctx, server, []*Log{})
 
-		// next := rf.nextIndex[server]
+	}
+	return rf.appendEntriesReplyCh
+}
 
-		var prevLogIndex int
-		var prevLogTerm int
+func (rf *Raft) appendEntries(ctx context.Context, server int, entries []*Log) <-chan *AppendEntriesTuple {
+	reply := AppendEntriesReply{}
 
+	var prevLogIndex int
+	var prevLogTerm int
+
+	// heartbeat
+	// TODO: combine this if possible
+	if len(entries) == 0 {
 		if len(rf.logs) == 0 {
 			prevLogIndex = rf.snapshotIndex
 			prevLogTerm = rf.snapshotTerm
@@ -980,39 +1274,36 @@ func (rf *Raft) sendEmptyAppendEntriesToPeers(ctx context.Context) <-chan *Appen
 			prevLogIndex = rf.logs[len(rf.logs)-1].Index
 			prevLogTerm = rf.logs[len(rf.logs)-1].Term
 		}
-
-		// if next-rf.snapshotIndex <= 1 {
-		// 	prevLogIndex = rf.snapshotIndex
-		// 	prevLogTerm = rf.snapshotTerm
-		// } else {
-		// 	prevLogIndex = rf.logs[next-rf.snapshotIndex-2].Index
-		// 	prevLogTerm = rf.logs[next-rf.snapshotIndex-2].Term
-		// }
-		req := &AppendEntriesArgs{
-			Term:         term,
-			LeaderId:     rf.me,
-			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  prevLogTerm,
-			Entries:      []*Log{},
-			LeaderCommit: rf.commitIndex,
+	} else {
+		//FIX
+		next := rf.nextIndex[server]
+		if rf.nextIndex[server]-rf.snapshotIndex <= 1 {
+			prevLogIndex = rf.snapshotIndex
+			prevLogTerm = rf.snapshotTerm
+		} else {
+			prevLogIndex = rf.logs[next-rf.snapshotIndex-2].Index
+			prevLogTerm = rf.logs[next-rf.snapshotIndex-2].Term
 		}
-		eg.Go(func() error {
-			if ok := rf.sendAppendEntries(ctx, server, req, &replies[server]); !ok {
-				log.Printf("%d failed rpc request for appendEntry\n", rf.me)
-				replies[server] = AppendEntriesReply{}
-			}
-			rf.appendEntriesReplyCh <- &AppendEntriesTuple{reply: &replies[server], args: req, server: server}
-			return nil
-		})
+	}
+
+	req := &AppendEntriesArgs{
+		Term:         rf.getTerm(),
+		LeaderId:     rf.me,
+		Entries:      entries,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		LeaderCommit: rf.commitIndex,
 	}
 
 	go func() {
-		// defer close(replyCh)
-		eg.Wait()
-		log.Println("got all replies from rpc request for append entry")
+		if ok := rf.sendAppendEntries(ctx, server, req, &reply); !ok {
+			log.Printf("%d failed rpc request for appendEntry\n", rf.me)
+		}
+		rf.appendEntriesReplyCh <- &AppendEntriesTuple{reply: &reply, args: req, server: server}
 	}()
 
 	return rf.appendEntriesReplyCh
+
 }
 
 // called only in the main thread
@@ -1031,19 +1322,18 @@ func (rf *Raft) updateCommitIndex() {
 		if count > len(rf.peers)/2 && rf.logs[N-1-rf.snapshotIndex].Term == rf.currentTerm {
 			rf.commitIndex = N
 			log.Printf("%d found a suitable N: %d", rf.me, N)
+			// rf.applyToClient()
 		}
 	}
 }
 
 // called only in the main thread
 func (rf *Raft) applyToClient() {
-	res := make([]ApplyMsg, 0)
-	commitIndex := rf.commitIndex
 	log.Printf("%d start try applying %d, %d", rf.me, rf.commitIndex, rf.lastApplied)
 	if len(rf.logs) == 0 {
 		return
 	}
-	for commitIndex > rf.lastApplied {
+	for rf.commitIndex > rf.lastApplied {
 		rf.lastApplied++
 		l := rf.logs[rf.lastApplied-1-rf.snapshotIndex]
 		msg := ApplyMsg{
@@ -1051,13 +1341,9 @@ func (rf *Raft) applyToClient() {
 			Command:      l.Command,
 			CommandIndex: l.Index,
 		}
-		res = append(res, msg)
+		rf.applyCh <- msg
+		log.Printf("%d applied %v", rf.me, msg)
 	}
-	for _, val := range res {
-		rf.applyCh <- val
-		// log.Printf("%d applied %v", rf.me, val)
-	}
-	log.Printf("%d applied %v", rf.me, res)
 }
 
 func (rf *Raft) sendAppendEntries(ctx context.Context,
@@ -1072,40 +1358,13 @@ func (rf *Raft) sendAppendEntries(ctx context.Context,
 	return ok
 }
 
-// run the main thread that handles leadership and RPC requests.
-func (rf *Raft) run(ctx context.Context) {
-	log.Printf("%d starting the main loop", rf.me)
-
-	// every one is follower in the beginning
-	rf.setStatus(FOLLOWER)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		switch rf.getStatus() {
-		case FOLLOWER:
-			rf.runAsFollower(ctx)
-		case CANDIDATE:
-			rf.runAsCandidate(ctx)
-		case LEADER:
-			rf.runAsLeader(ctx)
-		}
-	}
-}
-
-//TODO: atomic read of rf.status
 func (rf *Raft) getStatus() status {
-	rf.stateLock.Lock()
-	defer rf.stateLock.Unlock()
+	rf.stateLock.RLock()
+	defer rf.stateLock.RUnlock()
 
 	return rf.status
 }
 
-//TODO: atomic update of rf.status OR, a rwlock
 func (rf *Raft) setStatus(s status) {
 	rf.stateLock.Lock()
 	rf.status = s
@@ -1113,415 +1372,17 @@ func (rf *Raft) setStatus(s status) {
 
 }
 
-//TODO: atomic read of rf.term
 func (rf *Raft) getTerm() int {
-	rf.stateLock.Lock()
-	defer rf.stateLock.Unlock()
+	rf.stateLock.RLock()
+	defer rf.stateLock.RUnlock()
 
 	return rf.currentTerm
 }
 
-//TODO: atomic read of rf.term
 func (rf *Raft) setTerm(term int) {
 	rf.stateLock.Lock()
 	rf.currentTerm = term
 	rf.stateLock.Unlock()
-}
-
-// runFollower runs the main loop while in the follower state.
-func (rf *Raft) runAsFollower(ctx context.Context) {
-	log.Printf("%d running in the main loop as follower", rf.me)
-
-	// things to do when we become a follower
-	r := ElectionTimeOutMin + rand.Intn(ElectionTimeOutMax-ElectionTimeOutMin+1)
-	t := time.Duration(r) * time.Millisecond
-	timeoutCh := time.After(t)
-
-	tryApplyTimeoutCh := time.After(50 * time.Millisecond)
-
-	for rf.getStatus() == FOLLOWER {
-		select {
-		case req := <-rf.requestVoteCh:
-			reply := &RequestVoteReply{}
-			rf.handleRequestVote(req.args, reply)
-			req.replyCh <- reply
-			close(req.replyCh)
-
-			// reset timer?
-			r = ElectionTimeOutMin + rand.Intn(ElectionTimeOutMax-ElectionTimeOutMin+1)
-			t = time.Duration(r) * time.Millisecond
-			timeoutCh = time.After(t)
-
-		case req := <-rf.appendEntriesCh:
-			reply := &AppendEntriesReply{}
-			rf.handleAppendEntries(req.args, reply)
-			req.replyCh <- reply
-			close(req.replyCh)
-
-			// reset timer
-			r = ElectionTimeOutMin + rand.Intn(ElectionTimeOutMax-ElectionTimeOutMin+1)
-			t = time.Duration(r) * time.Millisecond
-			timeoutCh = time.After(t)
-
-		case req := <-rf.snapshotRequestCh:
-			rf.handleSnapshot(req)
-
-		case req := <-rf.installSnapshotCh:
-			reply := &InstallSnapshotReply{}
-			rf.handleInstallSnapshot(req.args, reply)
-			req.replyCh <- reply
-			close(req.replyCh)
-
-		case req := <-rf.commandCh:
-			index, term, isLeader := rf.handleCommand(req.command)
-
-			req.replyCh <- &struct {
-				index    int
-				term     int
-				isLeader bool
-			}{
-				index,
-				term,
-				isLeader,
-			}
-			close(req.replyCh)
-
-		case <-tryApplyTimeoutCh:
-			rf.applyToClient()
-
-			tryApplyTimeoutCh = time.After(50 * time.Millisecond)
-		// case <-applyTimeOutCh:
-		// rf.applyToClient(ctx)
-
-		// applyTimeOutCh = time.After(10 * time.Millisecond)
-
-		// electionTimeOut expired
-		case <-timeoutCh:
-			rf.setStatus(CANDIDATE)
-
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// runCandidate runs the main loop while in the candidate state.
-func (rf *Raft) runAsCandidate(ctx context.Context) {
-	log.Printf("%d running in the main loop as candidate", rf.me)
-	// things to do when we become a candidate
-
-	r := ElectionTimeOutMin + rand.Intn(ElectionTimeOutMax-ElectionTimeOutMin+1)
-	t := time.Duration(r) * time.Millisecond
-	timeoutCh := time.After(t)
-
-	grantedVotes := 1 // includes my vote
-	votesNeeded := len(rf.peers) / 2
-
-	voteCh := rf.startElection(ctx)
-	// applyTimeOutCh := time.After(10 * time.Millisecond)
-
-	tryApplyTimeoutCh := time.After(50 * time.Millisecond)
-
-	for rf.getStatus() == CANDIDATE {
-		select {
-		case req := <-rf.requestVoteCh:
-			reply := &RequestVoteReply{}
-			rf.handleRequestVote(req.args, reply)
-			req.replyCh <- reply
-			close(req.replyCh)
-
-			// reset timer
-			r = ElectionTimeOutMin + rand.Intn(ElectionTimeOutMax-ElectionTimeOutMin+1)
-			t = time.Duration(r) * time.Millisecond
-			timeoutCh = time.After(t)
-		// instead of waiting for the entire votes, wait for seperate votes
-		case vote := <-voteCh:
-			// read all
-			// TEMP: avoid reading from closed channels
-			if vote == nil {
-				voteCh = nil
-				continue
-			}
-			// handle vote
-			if vote.Term > rf.getTerm() {
-				log.Printf("%d found a higher term stepping down\n", rf.me)
-				rf.handleHigherTermFound(vote.Term)
-				return
-			}
-
-			if vote.VoteGranted {
-				grantedVotes++
-			}
-			if grantedVotes > votesNeeded {
-				log.Printf("%d recieved %d / %d votes\n", rf.me, grantedVotes, len(rf.peers))
-				rf.setStatus(LEADER)
-				return
-			}
-
-		case req := <-rf.snapshotRequestCh:
-			rf.handleSnapshot(req)
-
-		case req := <-rf.installSnapshotCh:
-			reply := &InstallSnapshotReply{}
-			rf.handleInstallSnapshot(req.args, reply)
-			req.replyCh <- reply
-
-		case req := <-rf.commandCh:
-			log.Printf("%d received cmd %v as candidate", rf.me, req.command)
-			index, term, isLeader := rf.handleCommand(req.command)
-
-			req.replyCh <- &struct {
-				index    int
-				term     int
-				isLeader bool
-			}{
-				index,
-				term,
-				isLeader,
-			}
-			close(req.replyCh)
-
-		case req := <-rf.appendEntriesCh:
-			reply := &AppendEntriesReply{}
-			rf.handleAppendEntries(req.args, reply)
-			req.replyCh <- reply
-			close(req.replyCh)
-
-			// step down
-			if rf.getStatus() != CANDIDATE {
-				return
-			}
-		case <-tryApplyTimeoutCh:
-			rf.applyToClient()
-
-			tryApplyTimeoutCh = time.After(50 * time.Millisecond)
-
-		case <-timeoutCh:
-			// return as candidate, which will restart the voting process
-			return
-
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// runCandidate runs the main loop while in the leader state.
-func (rf *Raft) runAsLeader(ctx context.Context) {
-	log.Printf("%d running in the main loop as leader", rf.me)
-
-	// things to do when we first become a leader
-	rf.nextIndex = make([]int, len(rf.peers))
-	for idx := range rf.nextIndex {
-		if len(rf.logs) == 0 {
-			rf.nextIndex[idx] = rf.snapshotIndex + 1
-		} else {
-			rf.nextIndex[idx] = rf.logs[len(rf.logs)-1].Index + 1
-		}
-	}
-
-	rf.matchIndex = make([]int, len(rf.peers))
-
-	// send heart beat as new leader, once
-	leaderContext, leaderCancel := context.WithCancel(ctx)
-	defer leaderCancel()
-	rf.sendHeartBeat(leaderContext)
-
-	heartbeatTimeOutCh := time.After(150 * time.Millisecond)
-	//TODO: temp fix: instead of trying it every loop, do it after responses from followers
-	tryApplyTimeoutCh := time.After(50 * time.Millisecond)
-
-	for rf.getStatus() == LEADER {
-
-		select {
-		case req := <-rf.requestVoteCh:
-			reply := &RequestVoteReply{}
-			rf.handleRequestVote(req.args, reply)
-			req.replyCh <- reply
-			close(req.replyCh)
-
-		case req := <-rf.commandCh:
-			log.Printf("%d received cmd %v as leader", rf.me, req.command)
-			index, term, isLeader := rf.handleCommand(req.command)
-
-			log.Printf("%d replying to cmd %v as leader", rf.me, req.command)
-			req.replyCh <- &struct {
-				index    int
-				term     int
-				isLeader bool
-			}{
-				index,
-				term,
-				isLeader,
-			}
-			log.Printf("%d replied to cmd %v as leader", rf.me, req.command)
-
-			// not necessary, but good
-			close(req.replyCh)
-			rf.broadcastAppendEntries(leaderContext)
-
-		case replyTup := <-rf.appendEntriesReplyCh:
-			log.Printf("recieving reply from appned entries")
-			reply := replyTup.reply
-			req := replyTup.args
-			server := replyTup.server
-			if rf.getTerm() > reply.Term {
-				log.Printf("%d received an old reply\n", rf.me)
-				continue
-			}
-			if rf.getTerm() > req.Term {
-				log.Printf("%d received an old reply\n", rf.me)
-				continue
-			}
-			if reply.Term > rf.getTerm() {
-				rf.handleHigherTermFound(reply.Term)
-				return
-			}
-			if reply.Success {
-				// update nextIndex and matchIndex for follower
-				log.Printf("req: %v", req)
-				log.Printf("%d updating nextIndex and matchIndex for follower", rf.me)
-				log.Printf("%d before: %v, %v", rf.me, rf.nextIndex, rf.matchIndex)
-				// rf.matchIndex[server] = req.PrevLogIndex + len(req.Entries)
-				if len(req.Entries) != 0 {
-					if req.PrevLogIndex+len(req.Entries) > rf.matchIndex[server] {
-						rf.matchIndex[server] = req.PrevLogIndex + len(req.Entries)
-						rf.nextIndex[server] = rf.matchIndex[server] + 1
-					}
-				}
-				// if reply.LastIndex > rf.nextIndex[reply.PeerId] {
-				// 	rf.nextIndex[reply.PeerId] = reply.LastIndex
-				// }
-				log.Printf("%d after: %v, %v", rf.me, rf.nextIndex, rf.matchIndex)
-
-				rf.updateCommitIndex()
-				//TODO: if somethign does not work;
-				// peridiocally do this: If last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
-			} else { //retry, after decrementing nextIndex
-				log.Printf("%d reply was false from %d, try decrement", rf.me, server)
-
-				// decrement nextIndex
-				x := rf.snapshotIndex + 1
-				for _, val := range rf.logs {
-					if val.Term == reply.ConflictingTerm {
-						x = val.Index
-					}
-				}
-				// log.Printf("x: %d, conflicitngIndex: %d, my first log index %d", x, reply.FirstConflictingIndex, rf.logs[0].Index)
-				rf.nextIndex[server] = Max(x, reply.FirstConflictingIndex)
-				// when the leader has already discarded the next log entry that it needs to send...
-				if len(rf.logs) > 0 && rf.nextIndex[server] <= rf.logs[0].Index {
-					log.Printf("asking for install snapshot")
-					rf.requestInstallSnapshot(leaderContext, server)
-					continue
-					// continue
-				}
-				// log.Printf("%d decremented nextIndex for %d, %d", rf.me, server, rf.nextIndex[server])
-				// as of now, this has the side effect of
-				// peridiocally do this: If last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
-				rf.singleAppendEntries(leaderContext, server)
-			}
-			// has the side effect of peridiocally sending append entries
-			// rf.singleAppendEntries(leaderContext, server)
-
-		case <-heartbeatTimeOutCh:
-			rf.sendHeartBeat(leaderContext)
-			// refresh timer
-			heartbeatTimeOutCh = time.After(150 * time.Millisecond)
-
-		case req := <-rf.snapshotRequestCh:
-			rf.handleSnapshot(req)
-
-		// maybe we don't have to handle this rpc?
-		case req := <-rf.installSnapshotCh:
-			reply := &InstallSnapshotReply{}
-			rf.handleInstallSnapshot(req.args, reply)
-			req.replyCh <- reply
-
-		case reply := <-rf.installSnapshotReplyCh:
-			if reply.reply.Term > rf.currentTerm {
-				fmt.Println("recieved reply")
-				rf.handleHigherTermFound(reply.reply.Term)
-				continue
-			}
-
-			// retry append entries
-			rf.singleAppendEntries(leaderContext, reply.server)
-
-		// FIXME: remove?
-		case <-tryApplyTimeoutCh:
-			// rf.updateCommitIndex()
-			rf.applyToClient()
-
-			tryApplyTimeoutCh = time.After(50 * time.Millisecond)
-
-		case req := <-rf.appendEntriesCh:
-			reply := &AppendEntriesReply{}
-			rf.handleAppendEntries(req.args, reply)
-			req.replyCh <- reply
-
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-//
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
-//
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
-
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-
-	// Your initialization code here (2A, 2B, 2C).
-	rf.currentTerm = 0
-	rf.votedFor = -1
-
-	rf.heartbeatCh = make(chan struct{})
-	rf.voteRequestCh = make(chan struct{})
-
-	rf.applyCh = applyCh
-
-	// can buffer up to 1000 commands??
-	rf.commandCh = make(chan *StartRPC)
-
-	rf.snapshotIndex = 0
-	rf.snapshotTerm = -1
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-	rf.snapshot = persister.ReadSnapshot()
-
-	// when starting from snapshot, this should be updated
-	rf.commitIndex = rf.snapshotIndex
-	rf.lastApplied = rf.snapshotIndex
-
-	rf.snapshotRequestCh = make(chan *SnapshotRequest)
-	rf.installSnapshotCh = make(chan *InstallSnapshotRPC)
-	rf.installSnapshotReplyCh = make(chan *InstallSnapshotReplyWithServer)
-	rf.requestVoteCh = make(chan *RequestVoteRPC)
-	rf.appendEntriesCh = make(chan *AppendEntriesRPC)
-	rf.appendEntriesReplyCh = make(chan *AppendEntriesTuple)
-
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	rf.mainContext = ctx
-	rf.mainCancelFunc = cancelFunc
-
-	go rf.run(ctx)
-
-	return rf
 }
 
 func (rf *Raft) startElection(ctx context.Context) <-chan *RequestVoteReply {
@@ -1551,8 +1412,6 @@ func (rf *Raft) startElection(ctx context.Context) <-chan *RequestVoteReply {
 
 func (rf *Raft) requestVoteToPeers(ctx context.Context, req *RequestVoteArgs) <-chan *RequestVoteReply {
 
-	// we actually need rf.peers - 1, but this makes indexing easier
-	replies := make([]RequestVoteReply, len(rf.peers))
 	replyCh := make(chan *RequestVoteReply, len(rf.peers)-1)
 
 	eg, _ := errgroup.WithContext(ctx)
@@ -1561,12 +1420,12 @@ func (rf *Raft) requestVoteToPeers(ctx context.Context, req *RequestVoteArgs) <-
 		if server == rf.me {
 			continue
 		}
+		reply := RequestVoteReply{}
 		eg.Go(func() error {
-			if ok := rf.sendRequestVote(ctx, server, req, &replies[server]); !ok {
-				replies[server] = RequestVoteReply{VoteGranted: false}
-				// log.Printf("%d failed rpc request for request vote\n", rf.me)
+			if ok := rf.sendRequestVote(ctx, server, req, &reply); !ok {
+				log.Printf("%d failed rpc request for sendRequestVote\n", rf.me)
 			}
-			replyCh <- &replies[server]
+			replyCh <- &reply
 			return nil
 		})
 	}
@@ -1578,6 +1437,21 @@ func (rf *Raft) requestVoteToPeers(ctx context.Context, req *RequestVoteArgs) <-
 	}()
 
 	return replyCh
+}
+
+//
+// the tester doesn't halt goroutines created by Raft after each test,
+// but it does call the Kill() method. your code can use killed() to
+// check whether Kill() has been called. the use of atomic avoids the
+// need for a lock.
+//
+// the issue is that long-running goroutines use memory and may chew
+// up CPU time, perhaps causing later tests to fail and generating
+// confusing debug output. any goroutine with a long-running loop
+// should call killed() to check whether it should stop.
+//
+func (rf *Raft) Kill() {
+	rf.mainCancelFunc()
 }
 
 func init() {
