@@ -1207,10 +1207,8 @@ func (rf *Raft) broadcastAppendEntries(ctx context.Context) <-chan *AppendEntrie
 			next := rf.nextIndex[server]
 			if next-rf.snapshotIndex >= 1 {
 				entries = append(entries, rf.logs[next-1-rf.snapshotIndex:]...)
-			} else if len(rf.logs) > 0 && rf.logs[0].Index > next {
-				continue
+				rf.appendEntries(ctx, server, entries)
 			}
-			rf.appendEntries(ctx, server, entries)
 		}
 	}
 	return rf.appendEntriesReplyCh
