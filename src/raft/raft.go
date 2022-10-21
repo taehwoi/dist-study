@@ -23,7 +23,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
@@ -227,6 +226,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.installSnapshotCh = make(chan *InstallSnapshotRPC)
 	rf.requestVoteCh = make(chan *RequestVoteRPC)
 	rf.appendEntriesCh = make(chan *AppendEntriesRPC)
+	rf.appendEntriesReplyCh = make(chan *AppendEntriesTuple)
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	rf.mainContext = ctx
@@ -267,7 +267,7 @@ func (rf *Raft) runAsFollower(ctx context.Context) {
 	log.Printf("%d running in the main loop as follower", rf.me)
 
 	electionTimer := time.NewTimer(rf.nextElectionTime())
-	applyTimer := time.NewTimer(50 * time.Millisecond)
+	applyTimer := time.NewTimer(10 * time.Millisecond)
 
 	for rf.getStatus() == FOLLOWER {
 		select {
@@ -310,7 +310,7 @@ func (rf *Raft) runAsFollower(ctx context.Context) {
 			rf.setStatus(CANDIDATE)
 		case <-applyTimer.C:
 			rf.applyToClient()
-			applyTimer.Reset(50 * time.Millisecond)
+			applyTimer.Reset(10 * time.Millisecond)
 
 		case <-ctx.Done():
 			return
@@ -331,7 +331,7 @@ func (rf *Raft) runAsCandidate(ctx context.Context) {
 	// things to do when we become a candidate
 
 	electionTimer := time.NewTimer(rf.nextElectionTime())
-	applyTimer := time.NewTimer(50 * time.Millisecond)
+	applyTimer := time.NewTimer(10 * time.Millisecond)
 
 	grantedVotes := 1 // includes my vote
 	votesNeeded := len(rf.peers) / 2
@@ -409,7 +409,7 @@ func (rf *Raft) runAsCandidate(ctx context.Context) {
 
 		case <-applyTimer.C:
 			rf.applyToClient()
-			applyTimer.Reset(50 * time.Millisecond)
+			applyTimer.Reset(10 * time.Millisecond)
 
 		case <-ctx.Done():
 			return
@@ -438,7 +438,6 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 	rf.matchIndex = make([]int, len(rf.peers))
 
 	// init leader only channels
-	rf.appendEntriesReplyCh = make(chan *AppendEntriesTuple)
 	rf.installSnapshotReplyCh = make(chan *InstallSnapshotReplyWithServer)
 
 	// send heart beat as new leader
@@ -447,8 +446,8 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 	rf.sendHeartBeat(leaderContext)
 
 	heartbeatTimer := time.NewTimer(150 * time.Millisecond)
-	broadcastEntriesTimer := time.NewTimer(50 * time.Millisecond)
-	applyTimer := time.NewTimer(50 * time.Millisecond)
+	broadcastEntriesTimer := time.NewTimer(10 * time.Millisecond)
+	applyTimer := time.NewTimer(10 * time.Millisecond)
 
 	for rf.getStatus() == LEADER {
 
@@ -475,10 +474,10 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 			// log.Printf("%d replied to cmd %v as leader", rf.me, req.command)
 
 			// instead of broadcasting append entries every single time a command is recieved, buffer it
-			// rf.broadcastAppendEntries(leaderContext)
+			rf.broadcastAppendEntries(leaderContext)
 		case <-broadcastEntriesTimer.C:
 			rf.broadcastAppendEntries(leaderContext)
-			broadcastEntriesTimer.Reset(50 * time.Millisecond)
+			broadcastEntriesTimer.Reset(10 * time.Millisecond)
 
 		case replyTup := <-rf.appendEntriesReplyCh:
 			log.Printf("recieving reply from appned entries")
@@ -550,7 +549,7 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 
 		case <-applyTimer.C:
 			rf.applyToClient()
-			applyTimer.Reset(50 * time.Millisecond)
+			applyTimer.Reset(10 * time.Millisecond)
 
 		case <-ctx.Done():
 			return
@@ -1176,6 +1175,8 @@ func (rf *Raft) handleCommand(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 
+	log.Printf("%d adding %v to %v", rf.me, entry, rf.logs)
+
 	rf.logs = append(rf.logs, entry)
 	rf.persist()
 
@@ -1313,8 +1314,9 @@ func (rf *Raft) applyToClient() {
 			Command:      l.Command,
 			CommandIndex: l.Index,
 		}
+		log.Printf("%d try applying to ch %v", rf.me, msg)
 		rf.applyCh <- msg
-		log.Printf("%d applied %v", rf.me, msg)
+		log.Printf("%d applied to ch %v", rf.me, msg)
 	}
 }
 
@@ -1427,6 +1429,6 @@ func (rf *Raft) Kill() {
 }
 
 func init() {
-	log.SetOutput(ioutil.Discard)
-	log.SetFlags(0)
+	// log.SetOutput(ioutil.Discard)
+	// log.SetFlags(0)
 }
