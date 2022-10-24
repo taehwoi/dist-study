@@ -3,9 +3,11 @@ package kvraft
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
+	"log"
+	"time"
 
-	"6.824/kvraft/kvdb"
-
+	"6.824/kvraft/cmap"
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
@@ -15,7 +17,7 @@ const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
-		// log.Printf(format, a...)
+		fmt.Printf(format, a...)
 	}
 	return
 }
@@ -45,11 +47,15 @@ type Reply struct {
 
 	cid int64 // cid of request
 	uid int64 // uid of request
+	idx int   // index of committed fmt
 }
 
 type OpFuture struct {
 	op      Op
 	replyCh chan *Reply
+
+	indexIfCommitted int
+	termIfCommitted  int
 }
 
 type KVServer struct {
@@ -58,9 +64,9 @@ type KVServer struct {
 	applyCh   chan raft.ApplyMsg
 	commandCh chan *OpFuture
 
-	db *kvdb.CMap[string, string]
+	store *cmap.CMap[string, string]
 
-	maxraftstate int // snapshot if log grows this big
+	maxraftstate int // snapshot if fmt grows this big
 
 	cancelFunc context.CancelFunc
 
@@ -82,45 +88,55 @@ func (kv *KVServer) runCmdReciever(ctx context.Context) {
 	for {
 		select {
 		case opFuture := <-kv.commandCh:
+			// fmt.Printf("GOT command %v\n", opFuture.op)
 			op := opFuture.op
 
-			// store future, so it can be later replied
-			kv.futureCh <- opFuture
+			// fmt.Printf("start command %v\n", opFuture.op)
+			idx, term, isLeader := kv.rf.Start(op)
+			// fmt.Printf("done command %v\n", opFuture.op)
+			opFuture.indexIfCommitted = idx
+			opFuture.termIfCommitted = term
 
-			_, _, isLeader := kv.rf.Start(op)
+			// store future, so it can be later replied
+			// fmt.Println("store future")
+			kv.futureCh <- opFuture
+			// fmt.Println("stored future")
 
 			if !isLeader {
-				fmt.Printf("%d %v went to wrong leader \n", kv.me, op)
+				// fmt.Printf("%d %v went to wrong leader \n", kv.me, op)
+				// fmt.Printf("send to cmd doneCh\n")
 				kv.doneCh <- &Reply{err: ErrWrongLeader, uid: op.UID, cid: op.CID}
+				// fmt.Printf("sent to cmd doneCh\n")
 			} else {
-				fmt.Printf("%d %v went to leader \n", kv.me, op)
+				// fmt.Printf("%d %v went to leader \n", kv.me, op)
 			}
+
 		case <-ctx.Done():
 			return
 		}
+		// fmt.Println("recv exited")
 	}
 }
 
 func (kv *KVServer) runCmdApplier(ctx context.Context) {
-	fmt.Println("running the main loop...")
-
 	lastClientReply := make(map[int64]*Reply)
 
 	for {
+		// fmt.Println("applier entered")
 		select {
 		// NOTE: blocking on applyCh creates a deadlock raft; so read asap
 		case res := <-kv.applyCh:
 			// apply command to db, as it has been committed to raft
 			op := res.Command.(Op)
-			res.CommandIndex
 
-			fmt.Printf("%d raft has agreed on %v\n", kv.me, op)
-			var reply *Reply
+			// fmt.Printf("%d raft has agreed on %v\n", kv.me, res)
+
+			reply := &Reply{idx: res.CommandIndex, uid: op.UID, cid: op.CID}
 
 			if cachedReply, ok := lastClientReply[op.CID]; ok {
 				// already replied
 				if cachedReply.uid == op.UID {
-					fmt.Printf("duplicate request---------------------!!!!!!!!!!!!!!!!!!!!!!!\n")
+					// fmt.Printf("duplicate request---------------------!!!!!!!!!!!!!!!!!!!!!!!\n")
 					kv.doneCh <- cachedReply
 					// no need to apply to db
 					break
@@ -128,23 +144,27 @@ func (kv *KVServer) runCmdApplier(ctx context.Context) {
 			}
 			switch op.Type {
 			case GET:
-				v, ok := kv.db.Get(op.Key)
+				v, ok := kv.store.Get(op.Key)
 
 				if !ok {
-					reply = &Reply{val: "", err: ErrNoKey, uid: op.UID, cid: op.CID}
+					reply.val = ""
+					reply.err = ErrNoKey
 				} else {
-					reply = &Reply{val: v, err: OK, uid: op.UID, cid: op.CID}
+					reply.val = v
+					reply.err = OK
 				}
 			case PUT:
-				kv.db.Put(op.Key, op.Value)
+				kv.store.Put(op.Key, op.Value)
 
-				reply = &Reply{err: OK, val: op.Value, uid: op.UID, cid: op.CID}
+				reply.err = OK
+				reply.val = op.Value
 			case APPEND:
-				kv.db.Append(op.Key, op.Value)
+				kv.store.Append(op.Key, op.Value)
 
-				reply = &Reply{err: OK, val: op.Value, uid: op.UID, cid: op.CID}
+				reply.err = OK
+				reply.val = op.Value
 			default:
-				fmt.Println("should not get here!!!!!!!!!!!!!!!!!!!!!!!")
+				// fmt.Println("should not get here!!!!!!!!!!!!!!!!!!!!!!!")
 			}
 
 			// store the cmd, so it is not executed again by client retry
@@ -153,36 +173,67 @@ func (kv *KVServer) runCmdApplier(ctx context.Context) {
 				// fmt.Printf("cached %v \n", lastClientReply)
 			}
 
+			// fmt.Println("applier send to doneCh")
 			kv.doneCh <- reply
+			// fmt.Println("applier done send to doneCh")
 
 		case <-ctx.Done():
 			return
 		}
+		// fmt.Println("applier exit")
 	}
 }
 
 func (kv *KVServer) runCmdReplier(ctx context.Context) {
 	// holds channels to reply stuff
-	chMap := make(map[int64]chan *Reply)
+	chMap := make(map[int64]*OpFuture)
+
+	termCheckTimer := time.NewTicker(100 * time.Millisecond)
 
 	for {
+		// fmt.Println("replier entered")
 		select {
 		case future := <-kv.futureCh:
-			fmt.Printf("-------------------recieved future----\n")
+			// fmt.Printf("-------------------recieved future----\n")
 
-			chMap[future.op.UID] = future.replyCh
+			chMap[future.op.UID] = future
 
 		case reply := <-kv.doneCh:
-			fmt.Printf("-------------------recieved done----\n")
+			// fmt.Printf("-------------------recieved done----\n")
 			uid := reply.uid
-			if ch, ok := chMap[uid]; ok {
-				if ch != nil {
-					go func() {
-						defer close(ch)
-						ch <- reply
-					}()
-				}
+			if future, ok := chMap[uid]; ok {
+				future.replyCh <- reply
 				delete(chMap, uid)
+			}
+
+			// reply uncomitted, so that clients can try again
+			for key, future := range chMap {
+				if reply.idx == future.indexIfCommitted && reply.uid != future.op.UID {
+					// fmt.Printf("uncommitted logs")
+					future.replyCh <- &Reply{err: ErrWrongLeader}
+					delete(chMap, key)
+				}
+			}
+
+		case <-termCheckTimer.C:
+			// can we also reply false is not isLeader?
+			term, isLeader := kv.rf.GetState()
+
+			// leadership has changed; reply false for all remaining requests
+			if !isLeader {
+				for key, future := range chMap {
+					future.replyCh <- &Reply{err: ErrWrongLeader}
+					delete(chMap, key)
+				}
+			}
+
+			// reply false to all unanswered requests if term has changed
+			for key, future := range chMap {
+				if term > future.termIfCommitted {
+					// fmt.Printf("uncommitted logs")
+					future.replyCh <- &Reply{err: ErrWrongLeader}
+					delete(chMap, key)
+				}
 			}
 
 		case <-ctx.Done():
@@ -192,22 +243,24 @@ func (kv *KVServer) runCmdReplier(ctx context.Context) {
 
 }
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	fmt.Printf("recieved get %v\n", args)
+	// fmt.Printf("recieved get %v\n", args)
 	op := Op{Type: GET, Key: args.Key, UID: args.UID, CID: args.CID}
 	replyCh := make(chan *Reply)
+	defer close(replyCh)
 
-	fmt.Printf("try submitting get %v\n", args)
+	// fmt.Printf("try submitting get %v\n", args)
 	kv.commandCh <- &OpFuture{op: op, replyCh: replyCh}
-	fmt.Printf("submitted get %v\n", args)
+	// fmt.Printf("submitted get %v\n", args)
 
 	// wait until applied
 	res := <-replyCh
+	// fmt.Printf("replied get %v\n", args)
 	reply.Err = res.err
 	reply.Value = res.val
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	fmt.Printf("recieved putAppend %v\n", args)
+	// fmt.Printf("recieved putAppend %v\n", args)
 	var op Op
 	if args.Op == "Put" {
 		op = Op{Type: PUT, Key: args.Key, Value: args.Value, UID: args.UID, CID: args.CID}
@@ -215,13 +268,15 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		op = Op{Type: APPEND, Key: args.Key, Value: args.Value, UID: args.UID, CID: args.CID}
 	}
 	replyCh := make(chan *Reply)
+	defer close(replyCh)
 
-	fmt.Printf("try submitting putAppend %v\n", args)
+	// fmt.Printf("try submitting putAppend %v\n", args)
 	kv.commandCh <- &OpFuture{op: op, replyCh: replyCh}
-	fmt.Printf("submitted putAppend %v\n", args)
+	// fmt.Printf("submitted putAppend %v\n", args)
 
 	// wait until applied
 	res := <-replyCh
+	// fmt.Printf("replied putAppend %v\n", args)
 	reply.Err = res.err
 }
 
@@ -250,7 +305,7 @@ func (kv *KVServer) Kill() {
 // implementation, which should call persister.SaveStateAndSnapshot() to
 // atomically save the Raft state along with the snapshot.
 // the k/v server should snapshot when Raft's saved state exceeds maxraftstate bytes,
-// in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
+// in order to allow Raft to garbage-collect its fmt. if maxraftstate is -1,
 // you don't need to snapshot.
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
@@ -259,7 +314,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 
-	fmt.Printf("start kv server\n")
+	// fmt.Printf("start kv server\n")
 	labgob.Register(Op{})
 
 	kv := new(KVServer)
@@ -277,7 +332,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	kv.db = kvdb.Make[string]()
+	kv.store = cmap.Make[string, string]()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	kv.cancelFunc = cancel
@@ -285,4 +340,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.run(ctx)
 
 	return kv
+}
+
+func init() {
+	log.SetOutput(ioutil.Discard)
+	log.SetFlags(0)
 }

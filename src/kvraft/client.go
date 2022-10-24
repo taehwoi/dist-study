@@ -2,7 +2,6 @@ package kvraft
 
 import (
 	"crypto/rand"
-	"fmt"
 	"math/big"
 
 	"sync/atomic"
@@ -28,7 +27,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.cid = nrand()
-	fmt.Printf("creating client %d\n", ck.cid)
+	// fmt.Printf("creating client %d\n", ck.cid)
 	// You'll have to add code here.
 	return ck
 }
