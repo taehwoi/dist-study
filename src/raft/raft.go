@@ -217,7 +217,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.snapshot = persister.ReadSnapshot()
 
 	// when starting from snapshot, this should be updated
-	rf.commitIndex = rf.snapshotIndex
+	// rf.commitIndex = rf.snapshotIndex
 	rf.lastApplied = rf.snapshotIndex
 
 	rf.snapshotRequestCh = make(chan *SnapshotRequest)
@@ -503,6 +503,7 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 			} else { //retry, after decrementing nextIndex
 				log.Printf("%d reply was false from %d, try decrement\n", rf.me, server)
 
+				// TODO : FIXME
 				prev := rf.nextIndex[server]
 				// decrement nextIndex
 				x := rf.snapshotIndex + 1
@@ -551,8 +552,9 @@ func (rf *Raft) runAsLeader(ctx context.Context) {
 			if reply.reply.Term > rf.currentTerm {
 				rf.handleHigherTermFound(reply.reply.Term)
 			}
-
-			rf.nextIndex[reply.server] = reply.snapshoIndex + 1
+			// NOT NEEDED?? WHY???????????
+			// rf.nextIndex[reply.server] = reply.snapshoIndex + 1
+			// rf.matchIndex[reply.server] = reply.snapshoIndex
 
 		case req := <-rf.appendEntriesCh:
 			reply := &AppendEntriesReply{}
@@ -628,6 +630,7 @@ func (rf *Raft) persist() {
 		data := w.Bytes()
 		rf.persister.SaveStateAndSnapshot(data, nil)
 	}
+
 }
 
 // restore previously persisted state.
@@ -649,6 +652,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.logs = buf.Logs
 		rf.snapshotIndex = buf.SnapshotIndex
 		rf.snapshotTerm = buf.SnapshotTerm
+		rf.lastApplied = buf.SnapshotIndex
 	}
 }
 
@@ -676,39 +680,30 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 // should only be called in the main thread
 func (rf *Raft) handleSnapshot(req *SnapshotRequest) {
-	log.Printf("%d handling snapshot request", rf.me)
-	log.Printf("%d's logs %v", rf.me, rf.logs)
+	log.Printf("%d handling snapshot request\n", rf.me)
+	log.Printf("%d's logs %v\n", rf.me, rf.logs)
 	log.Printf("%d's snapshot %v", rf.me, rf.snapshot)
-	log.Printf("%d's snapshotIndex %d", rf.me, rf.snapshotIndex)
-	log.Printf("%d's snapshotTerm %d", rf.me, rf.snapshotTerm)
+	log.Printf("%d's snapshotIndex %d\n", rf.me, rf.snapshotIndex)
+	log.Printf("%d's snapshotTerm %d\n", rf.me, rf.snapshotTerm)
 	// Your code here (2D).
 
 	// ignore old
-	if req.index <= rf.snapshotIndex {
-		return
+	for idx, log := range rf.logs {
+		if log.Index == req.index {
+			rf.snapshot = req.snapshot
+			rf.logs = rf.logs[idx+1:]
+			rf.snapshotIndex = log.Index
+			rf.snapshotTerm = log.Term
+			rf.persist()
+			break
+		}
 	}
 
-	snapshot := req.snapshot
-	index := req.index
-
-	rf.snapshot = snapshot
-
-	toKeep := index + 1
-
-	//FIXME?
-	if index-1-rf.snapshotIndex < 0 || len(rf.logs) < index-1-rf.snapshotIndex {
-		rf.snapshotTerm = -1
-	} else {
-		rf.snapshotTerm = rf.logs[index-1-rf.snapshotIndex].Term
-	}
-	rf.logs = rf.logs[toKeep-rf.snapshotIndex-1:]
-	rf.snapshotIndex = index
-	rf.persist()
-
-	log.Printf("%d's logs after snap %v", rf.me, rf.logs)
+	log.Printf("%d's logs after snap %v\n", rf.me, rf.logs)
 	log.Printf("%d's snapshot after snap %v", rf.me, rf.snapshot)
-	log.Printf("%d's snapshotIndex after snap %d", rf.me, rf.snapshotIndex)
-	log.Printf("%d's snapshotTerm after snap %d", rf.me, rf.snapshotTerm)
+	log.Printf("%d's snapshotIndex after snap %d\n", rf.me, rf.snapshotIndex)
+	log.Printf("%d's lastApplied after snap %d\n", rf.me, rf.lastApplied)
+	log.Printf("%d's snapshotTerm after snap %d\n", rf.me, rf.snapshotTerm)
 }
 
 // example RequestVote RPC arguments structure.
@@ -773,8 +768,10 @@ type InstallSnapshotReply struct {
 
 // should only be called in the main thread
 func (rf *Raft) handleInstallSnapshot(args *InstallSnapshotRequest, reply *InstallSnapshotReply) {
-	log.Printf("%d starting handle install snapshot request", rf.me)
-	log.Printf("%d current logs: %v", rf.me, rf.logs)
+	log.Printf("--------------------------------\n")
+	log.Printf("%d starting handle install snapshot request\n", rf.me)
+	log.Printf("%d current logs: %v\n", rf.me, rf.logs)
+	log.Printf("snapshot args: %v", args)
 
 	reply.Term = rf.getTerm()
 
@@ -787,47 +784,47 @@ func (rf *Raft) handleInstallSnapshot(args *InstallSnapshotRequest, reply *Insta
 		rf.handleHigherTermFound(args.Term)
 	}
 
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(Data{
-		CurrentTerm: rf.currentTerm,
-		VotedFor:    rf.votedFor,
-		Logs:        rf.logs,
-	})
-	data := w.Bytes()
+	// 6. If existing log entry has same index and term as snapshot’s
+	// last included entry, retain log entries following it and reply
+	for idx, log := range rf.logs {
+		if log.Index == args.LastIncludedIndex && log.Term == args.LastIncludedTerm {
+			rf.snapshotIndex = args.LastIncludedIndex
+			rf.snapshotTerm = args.LastIncludedTerm
+			rf.lastApplied = args.LastIncludedIndex
+			// save snapshot
+			rf.snapshot = args.Data
+			rf.logs = rf.logs[idx+1:]
+			rf.persist()
+			msg := ApplyMsg{
+				CommandValid:  false,
+				SnapshotValid: true,
+				Snapshot:      args.Data,
+				SnapshotTerm:  args.LastIncludedTerm,
+				SnapshotIndex: args.LastIncludedIndex,
+			}
+			// fmt.Printf("%d snapshot apply msg: %v", rf.me, msg)
+			//FIXME? do we always have to apply to client?
+			rf.applyCh <- msg
+			return
+		}
+	}
+
+	// discard the entire log
+	rf.logs = make([]*Log, 0)
+	// reset state machine using snapshot contents
+	rf.snapshotIndex = args.LastIncludedIndex
+	rf.snapshotTerm = args.LastIncludedTerm
+	rf.lastApplied = args.LastIncludedIndex
 	// save snapshot
 	rf.snapshot = args.Data
-	rf.persister.SaveStateAndSnapshot(data, args.Data)
-	if args.Data == nil {
-		return
-	}
 
-	var lastLogIndex int
-	var lastLogTerm int
-	if len(rf.logs) > 0 {
-		lastLogIndex = rf.logs[len(rf.logs)-1].Index
-		lastLogTerm = rf.logs[len(rf.logs)-1].Term
-	} else {
-		lastLogIndex = -1
-	}
-
-	if lastLogIndex == rf.snapshotIndex && lastLogTerm == args.LastIncludedTerm {
-		//retain log entries following it
-		rf.logs = rf.logs[args.LastIncludedIndex-rf.snapshotIndex:]
-		rf.snapshotIndex = args.LastIncludedIndex
-		rf.snapshotTerm = args.LastIncludedTerm
-		rf.lastApplied = args.LastIncludedIndex
-		return
-	} else {
-		rf.logs = make([]*Log, 0)
-		rf.snapshotIndex = args.LastIncludedIndex
-		rf.snapshotTerm = args.LastIncludedTerm
-		rf.lastApplied = args.LastIncludedIndex
-	}
+	rf.persist()
 
 	// 8. reset state machine using snapshot contents
 	log.Printf("8. reset state machine using snapshot contents")
-	log.Printf("%d current logs after snapshot saving: %v", rf.me, rf.logs)
+	log.Printf("%d current logs after snapshot saving: %v\n", rf.me, rf.logs)
+	log.Printf("%d last applied after snapshot saving: %v\n", rf.me, rf.lastApplied)
+	log.Printf("%d' snapshotIndex: %d snapshotTerm: %d\n", rf.me, rf.snapshotIndex, rf.snapshotTerm)
 	msg := ApplyMsg{
 		CommandValid:  false,
 		SnapshotValid: true,
@@ -835,7 +832,7 @@ func (rf *Raft) handleInstallSnapshot(args *InstallSnapshotRequest, reply *Insta
 		SnapshotTerm:  args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
 	}
-	log.Printf("%d snapshot apply msg: %v", rf.me, msg)
+	// fmt.Printf("%d snapshot apply msg: %v", rf.me, msg)
 	rf.applyCh <- msg
 }
 
@@ -1050,6 +1047,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		lastLogIndex = rf.logs[len(rf.logs)-1].Index
 	}
 
+	// TODO : FIXME
 	if args.PrevLogIndex > lastLogIndex {
 		reply.Success = false
 		reply.FirstConflictingIndex = lastLogIndex
@@ -1061,6 +1059,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	// return
 	// }
 
+	// TODO : FIXME
 	// 2. if log doesn't contain an entry at prevLogIndex...
 	if args.PrevLogIndex > rf.snapshotIndex && rf.logs[args.PrevLogIndex-rf.snapshotIndex-1].Term != args.PrevLogTerm {
 		//
@@ -1310,9 +1309,13 @@ func (rf *Raft) updateCommitIndex() {
 		}
 		// log.Printf("%d N: %d, matchIndex: %d, count %d, logs size: %d %v", rf.me, N, rf.matchIndex, count, len(rf.logs), rf.logs)
 		log.Printf("%d N: %d, term: %d, snap %d, logs size: %d", rf.me, N, rf.currentTerm, rf.snapshotIndex, len(rf.logs))
-		log.Printf("%d logTerm: %d", rf.me, rf.logs[N-1-rf.snapshotIndex].Term)
-		if count > len(rf.peers)/2 && rf.logs[N-1-rf.snapshotIndex].Term == rf.currentTerm {
-			rf.commitIndex = N
+		//FIXME: snapshot index is sometimes update weirdly
+		if count > len(rf.peers)/2 {
+			for _, log := range rf.logs {
+				if log.Index == N && log.Term == rf.currentTerm {
+					rf.commitIndex = N
+				}
+			}
 			log.Printf("%d found a suitable N: %d", rf.me, N)
 			// we don't need to call applyClient here, because broadcastAppendEntries will handle it
 			// rf.applyToClient()
@@ -1328,7 +1331,11 @@ func (rf *Raft) applyToClient() {
 		return
 	}
 	for rf.commitIndex > rf.lastApplied {
+		// temp fix
 		rf.lastApplied++
+		if rf.lastApplied-rf.snapshotIndex-1 >= len(rf.logs) || rf.lastApplied-1-rf.snapshotIndex < 0 {
+			return
+		}
 		l := rf.logs[rf.lastApplied-1-rf.snapshotIndex]
 		msg := ApplyMsg{
 			CommandValid: true,

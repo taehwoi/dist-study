@@ -81,11 +81,8 @@ type KVServer struct {
 }
 
 type Snapshot struct {
+	Values      map[string]string
 	LatestReply map[int64]*Reply
-	LatestIndex int
-	LatestTerm  int //needed?
-
-	Values map[string]string
 }
 
 func (kv *KVServer) run(ctx context.Context) {
@@ -134,8 +131,13 @@ func (kv *KVServer) runCmdReciever(ctx context.Context) {
 
 func (kv *KVServer) runCmdApplier(ctx context.Context) {
 	//TODO
+
 	checkSizeTicker := time.NewTicker(100 * time.Millisecond)
-	defer checkSizeTicker.Stop()
+	if kv.maxraftstate != -1 {
+		defer checkSizeTicker.Stop()
+	} else {
+		checkSizeTicker.Stop()
+	}
 
 	for {
 		// fmt.Println("applier entered")
@@ -145,8 +147,10 @@ func (kv *KVServer) runCmdApplier(ctx context.Context) {
 
 			// install snapshot
 			if res.SnapshotValid {
-				kv.lastAppliedLogIndex = res.SnapshotIndex
 				kv.loadFromSnapshot(res.Snapshot)
+				// kv.lastAppliedLogIndex = res.SnapshotIndex
+				log.Printf("%d installing snapshot\n", kv.me)
+				log.Printf("%d db: %v \n", kv.me, kv.store)
 				break
 			}
 
@@ -166,6 +170,7 @@ func (kv *KVServer) runCmdApplier(ctx context.Context) {
 					break
 				}
 			}
+			log.Printf("%d applying %dth op %v to state\n", kv.me, res.CommandIndex, op)
 
 			switch op.Type {
 			case GET:
@@ -205,19 +210,17 @@ func (kv *KVServer) runCmdApplier(ctx context.Context) {
 			// fmt.Println("applier done send to doneCh")
 
 		case <-checkSizeTicker.C:
-			if kv.maxraftstate == -1 {
-				continue
-			}
 
 			if float64(kv.persister.RaftStateSize())/float64(kv.maxraftstate) > 0.8 {
 				w := new(bytes.Buffer)
 				e := labgob.NewEncoder(w)
 				e.Encode(Snapshot{
 					LatestReply: kv.lastClientReply,
-					LatestIndex: kv.lastAppliedLogIndex,
 					Values:      kv.store.Copy(),
 				})
 				data := w.Bytes()
+				log.Printf("%d taking snapshot upto %d\n", kv.me, kv.lastAppliedLogIndex)
+				log.Printf("%d db: %v \n", kv.me, kv.store)
 
 				kv.rf.Snapshot(kv.lastAppliedLogIndex, data)
 			}
@@ -348,7 +351,6 @@ func (kv *KVServer) loadFromSnapshot(snapshot []byte) {
 	} else {
 		kv.lastClientReply = buf.LatestReply
 		kv.store = cmap.MakeFrom(buf.Values)
-		kv.lastAppliedLogIndex = buf.LatestIndex
 	}
 
 }
