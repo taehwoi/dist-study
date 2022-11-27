@@ -36,6 +36,8 @@ type Err string
 
 type JoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
+
+	UID int64
 }
 
 type JoinReply struct {
@@ -43,8 +45,15 @@ type JoinReply struct {
 	Err         Err
 }
 
+type JoinFuture struct {
+	Args    *JoinArgs
+	ReplyCh chan *JoinReply
+}
+
 type LeaveArgs struct {
 	GIDs []int
+
+	UID int64
 }
 
 type LeaveReply struct {
@@ -52,9 +61,16 @@ type LeaveReply struct {
 	Err         Err
 }
 
+type LeaveFuture struct {
+	Args    *LeaveArgs
+	ReplyCh chan *LeaveReply
+}
+
 type MoveArgs struct {
 	Shard int
 	GID   int
+
+	UID int64
 }
 
 type MoveReply struct {
@@ -62,12 +78,24 @@ type MoveReply struct {
 	Err         Err
 }
 
+type MoveFuture struct {
+	Args    *MoveArgs
+	ReplyCh chan *MoveReply
+}
+
 type QueryArgs struct {
 	Num int // desired config number
+
+	UID int64
 }
 
 type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+}
+
+type QueryFuture struct {
+	Args    *QueryArgs
+	ReplyCh chan *QueryReply
 }

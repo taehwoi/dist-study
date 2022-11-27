@@ -401,3 +401,8 @@ func TestMulti(t *testing.T) {
 
 	fmt.Printf("  ... Passed\n")
 }
+
+func TestRebalance(t *testing.T) {
+	x := rebalance([10]int{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, []int{1})
+	fmt.Println(x)
+}
